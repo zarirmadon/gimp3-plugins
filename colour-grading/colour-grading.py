@@ -161,7 +161,7 @@ P = {
 
 PLUGIN_NAME  = 'colour-grading'
 MENU_LABEL   = 'Colour Grading'
-BUILD_TAG    = 'build 34'
+BUILD_TAG    = 'build 35'
 
 SHADOWS    = 'shadows'
 MIDTONES   = 'midtones'
@@ -824,6 +824,40 @@ PRESET_LOOKS = [
 PRESET_INDEX = {k: (label, tip, r) for k, label, tip, r in PRESET_LOOKS}
 
 
+def _tone_mask_from_lch(raw_lch, centre, core, outer):
+    """Return float Y matte using true CIE Lab L*, mapped to 0..1.
+
+    Tone handles and colour-picked tone selection use L*/100.  Read that
+    identical value from babl rather than the optional gamma-corrected
+    `gegl:component-extract` display representation.  The existing plateau
+    and feathering geometry is retained exactly.
+    """
+    low_active = centre - core > 1e-6
+    high_active = centre + core < 1.0 - 1e-6
+    inverse_width = 1.0 / max(1e-6, outer - core)
+    if _np is not None:
+        arr = _np.frombuffer(raw_lch, dtype=_np.float32).reshape(-1, 3)
+        value = arr[:, 0] * _np.float32(0.01)
+        matte = _np.ones(len(value), dtype=_np.float32)
+        if low_active:
+            matte *= _np.clip((value - (centre - outer)) * inverse_width, 0., 1.)
+        if high_active:
+            matte *= _np.clip(((centre + outer) - value) * inverse_width, 0., 1.)
+        return matte.tobytes()
+    from array import array
+    inp = array('f'); inp.frombytes(raw_lch)
+    out = array('f', [1.0]) * (len(inp) // 3)
+    for i in range(len(out)):
+        value = inp[i * 3] * 0.01
+        weight = 1.0
+        if low_active:
+            weight *= max(0., min(1., (value - (centre - outer)) * inverse_width))
+        if high_active:
+            weight *= max(0., min(1., ((centre + outer) - value) * inverse_width))
+        out[i] = weight
+    return out.tobytes()
+
+
 def _hue_mask_from_lch(raw_lch, centre_deg, core_deg, outer_deg):
     """A circular LCh hue matte with a soft chroma gate; output Y float bytes.
 
@@ -986,7 +1020,41 @@ class ManagedPreviewManager(PreviewManager):
 
     def _luma_mask(self,root,src,ctx,p):
         c=max(0.0,min(1.0,float(p.get('pos',.5)))); core,outer=self._widths(p.get('range',.2),p.get('spread',.5),.49)
-        return self._trapezoid(root,self._component(root,src,ctx,'lab-l'),c,core,outer)
+        base = getattr(self, '_hue_mask_buffer', None)
+        if base is None:
+            base = getattr(self, '_target_base_buffer', None)
+        if base is None:
+            return self._trapezoid(root,self._component(root,src,ctx,'lab-l'),c,core,outer)
+        extent = base.get_extent()
+        cache = getattr(self, '_hue_mask_cache', None)
+        key = ('tone', id(base), extent.x, extent.y, extent.width, extent.height,
+               round(c, 6), round(core, 6), round(outer, 6))
+        mask_buffer = None
+        if cache is not None and key in cache:
+            original, cached = cache[key]
+            if original is base:
+                mask_buffer = cached
+        if mask_buffer is None:
+            try:
+                mask_buffer = Gegl.Buffer.new('Y float', extent.x, extent.y,
+                                              extent.width, extent.height)
+                for y in range(extent.y, extent.y + extent.height, 96):
+                    height = min(96, extent.y + extent.height - y)
+                    rect = Gegl.Rectangle.new(extent.x, y, extent.width, height)
+                    samples = bytes(base.get(rect, 1.0, 'CIE LCH(ab) float',
+                                             Gegl.AbyssPolicy.NONE))
+                    mask_buffer.set(rect, 'Y float', _tone_mask_from_lch(samples, c, core, outer))
+                mask_buffer.flush()
+            except Exception as exc:
+                _dbg('Native Lab lightness mask unavailable; old path used: %r' % (exc,))
+                return self._trapezoid(root,self._component(root,src,ctx,'lab-l'),c,core,outer)
+            if cache is not None:
+                if len(cache) >= 6:
+                    cache.pop(next(iter(cache)))
+                cache[key] = (base, mask_buffer)
+        node = self._gop(root, 'gegl:buffer-source')
+        node.set_property('buffer', mask_buffer)
+        return node
 
     def _hue_mask(self,root,src,ctx,p):
         # Work in babl's *actual* CIE LCh coordinates, in degrees and native
@@ -1394,7 +1462,7 @@ class ManagedPreviewManager(PreviewManager):
         if any(abs(v)>eps for v in self._master_rgb): return True
         if abs(self._sat_value-1.0)>eps or abs(self._contrast_value)>eps: return True
         if any(abs(float(p.get('brightness',0)))>eps for p in self._tone_state): return True
-        if any(float(p.get('strength',0))>eps for p in self._tonal_colour_state): return True
+        if any(float(p.get('strength',0))>eps or abs(float(p.get('luminance',0)))>eps for p in self._tonal_colour_state): return True
         if any(max(abs(float(p.get('hue',0))),abs(float(p.get('saturation',0))),abs(float(p.get('luminance',0))))>eps for p in self._hue_adjust_state): return True
         if abs(float(self._global_hue))>eps: return True
         if any(abs(float(self._primaries_state[k][p]))>eps for k in ('red','green','blue') for p in ('hue','purity')): return True
