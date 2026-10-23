@@ -5,11 +5,24 @@ Runs the Upscayl CLI binary (upscayl-bin) against the active layer and
 imports the result as a new layer.
 
 Copyright (C) 2026 Zarir Madon
+Author: Zarir Madon
+Development assistance: OpenAI ChatGPT (GPT-6)
+Websites: https://zarirmadon.com | https://zmcreative.art
 
+License: GNU General Public License, version 3.0 (GPL-3.0-only).
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+the Free Software Foundation, version 3 of the License.
+
+Third-party acknowledgements (not bundled with this plug-in):
+- GIMP / libgimp / GIMP Python bindings: GIMP project; separate licenses.
+- Upscayl and its command-line upscaling backend: Upscayl project;
+  separate licenses apply to the installed executable and components.
+- NCNN: Tencent and contributors; separate license.
+- Vulkan: Khronos Group and implementation providers; separate licenses.
+- Upscaling model weights: their respective authors and model licenses.
+This Python plug-in invokes installed components; it does not relicense
+or redistribute those components or model weights.
 
 This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -59,6 +72,33 @@ FLATPAK_APP_ID = "org.upscayl.Upscayl"
 # on the internet is compatible (many "AI upscaler" models are PyTorch/
 # ONNX and need conversion first, out of scope here); these are sources
 # specifically confirmed to host the right format. Verified 2026-09.
+# Short, conservative descriptions of well-known Upscayl/Real-ESRGAN models.
+# Unrecognised custom names receive a neutral message, not a guessed capability.
+MODEL_DESCRIPTIONS = {
+    "realesrgan-x4plus": "General-purpose 4× restoration for photographs and mixed imagery.\nMay sharpen textures and edges; inspect fine detail at 100%.",
+    "realesrgan-x4plus-anime": "4× restoration tuned for anime-style illustration and clean linework.\nLess appropriate for natural photographic texture.",
+    "realesr-animevideov3-x4": "4× model designed for anime/video-style imagery and illustrated edges.\nSmooths flat regions; inspect fine photographic textures carefully.",
+    "realesr-animevideov3-x3": "3× anime/video-oriented super-resolution model.\nBest suited to animation and linework rather than photographic grain.",
+    "realesr-animevideov3-x2": "2× anime/video-oriented super-resolution model.\nDesigned for illustrated detail and relatively smooth colour areas.",
+    "remacri": "General image restoration/upscaling model often used for mixed content.\nCheck texture and edge treatment on your particular photograph.",
+    "ultramix_balanced": "Mixed-content upscaling model with a balanced restoration approach.\nInspect textures and fine detail before committing to large output.",
+    "ultrasharp": "Sharp-detail-oriented upscaling model.\nWatch for overly crisp edges or amplified artifacts.",
+    "digital-art-4x": "Upscayl model intended for digital artwork and illustration.\nInspect fine lines, gradients and any photographic elements.",
+    "high-fidelity-4x": "Upscayl model intended for detail-preserving restoration.\nCompare natural texture and edges against the original.",
+    "ultrasharp-4x": "Upscayl model oriented toward pronounced sharpness.\nMay emphasise edges and existing compression artifacts.",
+    "general-photo-4x": "Upscayl model intended for general photographic imagery.\nReview skin, foliage and fine texture at full resolution.",
+}
+
+
+def describe_model(name):
+    """Return a cautious note; never infer model behaviour from unknown names."""
+    key = name.strip().casefold()
+    if key in MODEL_DESCRIPTIONS:
+        return MODEL_DESCRIPTIONS[key]
+    return ("Custom NCNN model; characteristics are not documented in this plug-in.\n"
+            "Check the model author's notes and inspect a test result at 100%.")
+
+
 MODEL_SOURCE_LINKS = [
     (
         "Upscayl custom-models repo",
@@ -287,15 +327,43 @@ class UpscaylDialog(Gtk.Dialog):
 
         box = self.get_content_area()
         box.set_spacing(8)
-        box.set_border_width(12)
+        box.set_border_width(10)
+
+        # Compact, native GTK3 outlined sections: no theme-specific CSS.
+        def section(title, tooltip=None):
+            frame = Gtk.Frame()
+            frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+            heading = Gtk.Label()
+            heading.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+            heading.set_xalign(0)
+            if tooltip:
+                heading.set_tooltip_text(tooltip)
+            frame.set_label_widget(heading)
+            frame.set_label_align(0.025, 0.5)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            content.set_border_width(9)
+            frame.add(content)
+            box.pack_start(frame, False, False, 0)
+            return content
+
+        model_section = section("MODEL", "Select a compatible Upscayl NCNN model.")
 
         # Bundled models, separator, then alphabetically sorted custom models.
         model_row = self._labeled_row("Model:", "Choose a bundled Upscayl model or a custom NCNN model. Custom models appear below the separator.")
         self.model_combo = Gtk.ComboBoxText()
         self.model_combo.set_tooltip_text("Bundled models first; custom models alphabetically below the separator.")
         model_row.pack_start(self.model_combo, True, True, 0)
-        box.pack_start(model_row, False, False, 0)
+        model_section.pack_start(model_row, False, False, 0)
+        self.model_description = Gtk.Label(xalign=0)
+        self.model_description.set_line_wrap(True)
+        self.model_description.set_selectable(False)
+        self.model_description.set_tooltip_text("Model guidance updates when a different model is selected; unknown models are not assigned speculative properties.")
+        model_note_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        model_note_row.pack_start(self.model_description, True, True, 0)
+        self.model_description.set_use_markup(True)
+        model_section.pack_start(model_note_row, False, False, 0)
 
+        scale_section = section("SCALE", "Choose the enlargement factor or enhancement mode.")
         # Four direct scale choices matching the approved mockup.
         scale_row = self._labeled_row("Scale:", "1× enhancement, 2×, 4×, or two consecutive 4× passes (16×).")
         self.scale_buttons = {}
@@ -309,45 +377,64 @@ class UpscaylDialog(Gtk.Dialog):
             self.scale_buttons[name] = btn
             scale_row.pack_start(btn, False, False, 5)
         self.scale_buttons[saved_scale if saved_scale in self.scale_buttons else "4x"].set_active(True)
-        box.pack_start(scale_row, False, False, 0)
+        scale_section.pack_start(scale_row, False, False, 0)
 
+        dimension_section = section("DIMENSIONS", "Pixel and print dimensions of the input and output.")
         # Input and output boxes are identical in structure and width.
         dim_title = Gtk.Label(label="DIMENSIONS", xalign=0)
         dim_title.set_tooltip_text("Input layer pixels and final output pixels. Output is editable only with Custom output size enabled.")
-        box.pack_start(dim_title, False, False, 0)
+        # Heading supplied by the outlined section above.
+        dim_title.hide()
         dims = Gtk.Grid(column_spacing=8, row_spacing=6)
         dims.set_column_homogeneous(False)
-        box.pack_start(dims, False, False, 0)
+        dimension_section.pack_start(dims, False, False, 0)
+
+        # Display long side first; retain width/height identities for GIMP and NCNN.
+        iw, ih = drawable.get_width(), drawable.get_height()
+        self._portrait_dimensions = ih > iw
 
         def dim_panel(title, w, h, editable):
             frame = Gtk.Frame()
             frame.set_hexpand(True)
-            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
             inner.set_border_width(12)
             frame.add(inner)
+            heading_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
             label = Gtk.Label(label=title, xalign=0)
-            inner.pack_start(label, False, False, 0)
+            heading_row.pack_start(label, True, True, 0)
+            inner.pack_start(heading_row, False, False, 0)
             fields = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
             we, he = Gtk.Entry(), Gtk.Entry()
+            we.set_tooltip_text("Image width in pixels (horizontal axis).")
+            he.set_tooltip_text("Image height in pixels (vertical axis).")
             for entry, value in ((we, w), (he, h)):
-                entry.set_text(str(value)); entry.set_width_chars(7)
+                entry.set_text(str(value))
+                entry.set_width_chars(7)
                 entry.set_max_length(7)
                 entry.set_hexpand(True)
                 entry.set_sensitive(editable)
-                fields.pack_start(entry, True, True, 0)
-                if entry is we: fields.pack_start(Gtk.Label(label="×"), False, False, 0)
+            first, second = (he, we) if self._portrait_dimensions else (we, he)
+            fields.pack_start(first, True, True, 0)
+            fields.pack_start(Gtk.Label(label="×"), False, False, 0)
+            fields.pack_start(second, True, True, 0)
             inner.pack_start(fields, False, False, 0)
+            cm = Gtk.Label(xalign=0)
+            cm.set_tooltip_text("Physical long side × short side in centimetres, based on image resolution (PPI).")
+            other_units = Gtk.Label(xalign=0)
+            other_units.set_use_markup(True)
+            other_units.set_tooltip_text("Physical size in inches and metres, calculated from image PPI.")
             meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             ppi = Gtk.Label(label="PPI", xalign=0)
-            ratio = Gtk.Label(label="3:2", xalign=1)
+            ppi.set_tooltip_text("Image pixels per inch; determines the displayed print dimensions.")
+            ratio = Gtk.Label(label="—", xalign=1)
+            ratio.set_tooltip_text("Print-style width:height aspect ratio. Exact proportions use integers; near-matches show decimals.")
             meta.pack_start(ppi, True, True, 0)
             meta.pack_start(ratio, False, False, 0)
             inner.pack_start(meta, False, False, 0)
-            return frame, we, he, ppi, ratio
+            return frame, heading_row, we, he, ppi, ratio, cm, other_units
 
-        iw, ih = drawable.get_width(), drawable.get_height()
-        left, self.input_width, self.input_height, self.input_ppi, self.input_ratio = dim_panel("INPUT (LAYER)", iw, ih, False)
-        right, self.width_entry, self.height_entry, self.ppi_label, self.output_ratio = dim_panel("OUTPUT", iw * 4, ih * 4, False)
+        left, input_heading, self.input_width, self.input_height, self.input_ppi, self.input_ratio, self.input_cm, self.input_units = dim_panel("INPUT (LAYER)", iw, ih, False)
+        right, output_heading, self.width_entry, self.height_entry, self.ppi_label, self.output_ratio, self.output_cm, self.output_units = dim_panel("OUTPUT", iw * 4, ih * 4, False)
         dims.attach(left, 0, 0, 1, 1)
         self.chain_button = Gtk.ToggleButton(label="🔗")
         self.chain_button.set_active(self.settings.get("chain", "1") != "0")
@@ -355,12 +442,31 @@ class UpscaylDialog(Gtk.Dialog):
         self.chain_button.connect("toggled", self._on_chain_toggled)
         dims.attach(self.chain_button, 1, 0, 1, 1)
         dims.attach(right, 2, 0, 1, 1)
-        self.custom_output_check = Gtk.CheckButton(label="Custom output size")
-        self.custom_output_check.set_tooltip_text("Enable manual final output dimensions; without it, output is calculated from the selected scale.")
+        self.custom_output_check = Gtk.CheckButton()
+        custom_label = Gtk.Label()
+        custom_label.set_markup("<small><i>Custom</i></small>")
+        self.custom_output_check.add(custom_label)
+        self.custom_output_check.set_halign(Gtk.Align.END)
+        self.custom_output_check.set_tooltip_text("Enable manual output width and height; without it, dimensions follow the selected scale.")
         self.custom_output_check.set_active(self.settings.get("dimension_mode", "current") == "custom")
         self.custom_output_check.connect("toggled", self._on_custom_output_toggled)
-        # Checkbox below/outside the output frame, left-aligned with that frame.
-        dims.attach(self.custom_output_check, 2, 1, 1, 1)
+        # Checkbox and italic Custom label share the OUTPUT heading row.
+        output_heading.pack_end(self.custom_output_check, False, False, 0)
+        # Physical dimensions are outside the pixel frames, aligned beneath each.
+        def units_panel(cm, others):
+            panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            panel.set_margin_start(12)
+            panel.pack_start(cm, False, False, 0)
+            inches = Gtk.Label(xalign=0)
+            metres = Gtk.Label(xalign=0)
+            for label in (inches, metres):
+                label.set_tooltip_text("Physical dimensions calculated from the current PPI.")
+                panel.pack_start(label, False, False, 0)
+            return panel, inches, metres
+        input_units_panel, self.input_inches, self.input_metres = units_panel(self.input_cm, self.input_units)
+        output_units_panel, self.output_inches, self.output_metres = units_panel(self.output_cm, self.output_units)
+        dims.attach(input_units_panel, 0, 1, 1, 1)
+        dims.attach(output_units_panel, 2, 1, 1, 1)
         self.width_entry.connect("changed", lambda w: self._on_output_edited("width"))
         self.height_entry.connect("changed", lambda w: self._on_output_edited("height"))
         self._dimension_guard = False
@@ -379,14 +485,18 @@ class UpscaylDialog(Gtk.Dialog):
         self.output_image_radio.set_active(self.settings.get("output", "layer") == "image")
         output_row.pack_start(self.output_layer_radio, False, False, 0)
         output_row.pack_start(self.output_image_radio, False, False, 12)
-        box.pack_start(output_row, False, False, 0)
+        result_section = section("RESULT", "Choose where GIMP will place the processed image.")
+        result_section.pack_start(output_row, False, False, 0)
 
         # Keep advanced settings below the main image controls.
         advanced = Gtk.Expander(label="Advanced options")
         advbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         advbox.set_border_width(8)
         advanced.add(advbox)
-        box.pack_start(advanced, False, False, 0)
+        advanced_frame = Gtk.Frame()
+        advanced_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+        advanced_frame.add(advanced)
+        box.pack_start(advanced_frame, False, False, 0)
         custom_row = self._labeled_row("Custom models:", "Select a folder containing matching .param and .bin files.")
         self._model_folder = self.settings.get("custom_model_dir", "")
         self.modeldir_chooser = Gtk.Button(label="Choose custom models folder…")
@@ -404,15 +514,44 @@ class UpscaylDialog(Gtk.Dialog):
         custom_row.pack_start(browse_btn, False, False, 0)
         advbox.pack_start(custom_row, False, False, 0)
 
-        tile_row = self._labeled_row("Tile size:", "NCNN tile size. 0 = automatic.")
-        self.tile_entry = Gtk.Entry(); self.tile_entry.set_width_chars(8)
-        self.tile_entry.set_text(self.settings.get("tile_size", "0")); self.tile_entry.set_placeholder_text("0 = auto")
-        tile_row.pack_start(self.tile_entry, False, False, 0); advbox.pack_start(tile_row, False, False, 0)
+        tile_row = self._labeled_row("Tile size:", "NCNN tile width in pixels. Auto lets the backend choose; custom values must be at least 32.")
+        self.tile_combo = Gtk.ComboBoxText()
+        self.tile_combo.set_tooltip_text("Automatic (0) selects a tile size based on device memory. Smaller tiles can reduce peak GPU memory usage; larger tiles may be faster.")
+        tile_sizes = ("0", "32", "64", "100", "128", "200", "256", "512")
+        for size in tile_sizes:
+            self.tile_combo.append(size, "Automatic (0)" if size == "0" else f"{size} px")
+        saved_tile = self.settings.get("tile_size", "0")
+        self.tile_combo.set_active_id(saved_tile if saved_tile in tile_sizes else "0")
+        tile_row.pack_start(self.tile_combo, False, False, 0)
+        advbox.pack_start(tile_row, False, False, 0)
 
-        threads_row = self._labeled_row("Threads:", "NCNN load:process:save thread counts. Blank uses the backend default.")
-        self.threads_entry = Gtk.Entry(); self.threads_entry.set_width_chars(12)
-        self.threads_entry.set_text(self.settings.get("threads", "")); self.threads_entry.set_placeholder_text("default (1:2:2)")
-        threads_row.pack_start(self.threads_entry, False, False, 0); advbox.pack_start(threads_row, False, False, 0)
+        threads_row = self._labeled_row("Threads:", "Set load, processing and save thread counts separately. Backend default uses 1:2:2.")
+        saved_threads = self.settings.get("threads", "")
+        saved_parts = saved_threads.split(":")
+        valid_saved = (len(saved_parts) == 3 and all(part.isdigit() and 1 <= int(part) <= 64 for part in saved_parts))
+        self.threads_default = Gtk.CheckButton(label="Default")
+        self.threads_default.set_tooltip_text("Use the NCNN backend default threading. Disable to set Load, Process and Save separately.")
+        self.threads_default.set_active(not valid_saved)
+        threads_row.pack_start(self.threads_default, False, False, 2)
+        self.thread_spins = []
+        for idx, (caption, explanation, default) in enumerate((
+            ("Load", "Threads that read and decode input tiles.", 1),
+            ("Process", "Threads that dispatch NCNN upscaling work.", 2),
+            ("Save", "Threads that encode output image tiles.", 2),
+        )):
+            label = Gtk.Label(label=caption)
+            label.set_tooltip_text(explanation)
+            threads_row.pack_start(label, False, False, 2)
+            spin = Gtk.SpinButton.new_with_range(1, 64, 1)
+            spin.set_numeric(True)
+            spin.set_width_chars(2)
+            spin.set_tooltip_text(f"{caption} thread count, from 1 to 64. {explanation}")
+            spin.set_value(int(saved_parts[idx]) if valid_saved else default)
+            threads_row.pack_start(spin, False, False, 0)
+            self.thread_spins.append(spin)
+        self.threads_default.connect("toggled", self._on_threads_default_toggled)
+        self._on_threads_default_toggled(self.threads_default)
+        advbox.pack_start(threads_row, False, False, 0)
 
         tta_row = self._labeled_row("TTA:", "Test-Time Augmentation. Higher processing cost; off by default.")
         self.tta_check = Gtk.CheckButton(label="Enable")
@@ -426,7 +565,8 @@ class UpscaylDialog(Gtk.Dialog):
         self.diag_status = Gtk.Label(xalign=0)
         diag_row.pack_start(diag_btn, False, False, 0)
         diag_row.pack_start(self.diag_status, True, True, 8)
-        box.pack_start(diag_row, False, False, 0)
+        advbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+        advbox.pack_start(diag_row, False, False, 0)
 
         box.show_all()
         self.add_button("Reset", 1001)
@@ -458,11 +598,62 @@ class UpscaylDialog(Gtk.Dialog):
     def _set_ppi_label(self):
         try:
             vals = self._numbers_from_gi(self.image.get_resolution())
-            ppi = f"{vals[0]:.0f} PPI" if len(vals) == 2 else "PPI unavailable"
+            self._ppi_x, self._ppi_y = (float(vals[0]), float(vals[1])) if len(vals) == 2 else (0.0, 0.0)
         except Exception:
-            ppi = "PPI unavailable"
+            self._ppi_x, self._ppi_y = 0.0, 0.0
+        ppi = (f"{self._ppi_x:.0f} PPI" if abs(self._ppi_x - self._ppi_y) < 0.01
+               else f"{self._ppi_x:.0f} × {self._ppi_y:.0f} PPI") if self._ppi_x > 0 and self._ppi_y > 0 else "PPI unavailable"
         self.ppi_label.set_text(ppi)
         self.input_ppi.set_text(ppi)
+
+    @staticmethod
+    def _long_short_ratio(w, h):
+        """Print-style width:height ratio, keeping portrait/landscape orientation.
+
+        Match common print proportions exactly when the pixels permit; for a
+        near-match, retain a familiar short integer side and display the
+        other side with decimals rather than claiming an exact crop.
+        """
+        if w <= 0 or h <= 0:
+            return "—"
+        from math import gcd
+        divisor = gcd(w, h)
+        a, b = w // divisor, h // divisor
+        if a <= 20 and b <= 20:
+            return f"{a}:{b}"
+        familiar = ((1, 1), (5, 4), (4, 5), (4, 3), (3, 4),
+                    (3, 2), (2, 3), (7, 5), (5, 7),
+                    (16, 9), (9, 16), (2, 1), (1, 2))
+        ratio = w / h
+        closest = min(familiar, key=lambda ab: abs(ratio / (ab[0] / ab[1]) - 1))
+        if abs(ratio / (closest[0] / closest[1]) - 1) <= 0.035:
+            if w >= h:
+                return f"{closest[1] * w / h:.2f}:{closest[1]}"
+            return f"{closest[0]}:{closest[0] * h / w:.2f}"
+        return f"{ratio:.2f}:1" if w >= h else f"1:{h / w:.2f}"
+
+    def _update_physical_dimensions(self, w, h, cm_label, other_label):
+        inches_label, metres_label = ((self.input_inches, self.input_metres)
+                                      if cm_label is self.input_cm else (self.output_inches, self.output_metres))
+        if w <= 0 or h <= 0 or self._ppi_x <= 0 or self._ppi_y <= 0:
+            cm_label.set_text("cm: —")
+            inches_label.set_text("in: —")
+            metres_label.set_text("m: —")
+            return
+        width_inches, height_inches = w / self._ppi_x, h / self._ppi_y
+        long_inches, short_inches = ((height_inches, width_inches) if self._portrait_dimensions
+                                     else (width_inches, height_inches))
+        cm_label.set_text(f"{long_inches * 2.54:.2f} × {short_inches * 2.54:.2f} cm")
+        inches_label.set_text(f"{long_inches:.2f} × {short_inches:.2f} in")
+        metres_label.set_text(f"{long_inches * 0.0254:.3f} × {short_inches * 0.0254:.3f} m")
+
+    def _update_output_measurements(self):
+        try:
+            w, h = int(self.width_entry.get_text()), int(self.height_entry.get_text())
+        except ValueError:
+            w, h = 0, 0
+        self.output_ratio.set_text(self._long_short_ratio(w, h))
+        self._update_physical_dimensions(w, h, self.output_cm, self.output_units)
 
     def _on_scale_changed(self, button):
         if not button.get_active() or not hasattr(self, "width_entry"):
@@ -474,6 +665,7 @@ class UpscaylDialog(Gtk.Dialog):
             self.height_entry.set_text(str(h * self._scale_factor()))
             self._dimension_guard = False
             self._on_output_edited("width")
+            self._update_output_measurements()
         else:
             self._refresh_dimensions()
 
@@ -504,6 +696,7 @@ class UpscaylDialog(Gtk.Dialog):
             self._custom_values = (str(base_w * factor), str(base_h * factor))
             self._dimension_guard = False
             if self.chain_button.get_active(): self._on_output_edited("width")
+            self._update_output_measurements()
         else:
             self._refresh_dimensions()
 
@@ -523,9 +716,9 @@ class UpscaylDialog(Gtk.Dialog):
                     self.width_entry.set_text(str(w))
             if w > 0 and h > 0:
                 self._custom_values = (str(w), str(h))
-                self.output_ratio.set_text(f"{w / h:.2f}:1")
+                self._update_output_measurements()
             else:
-                self.output_ratio.set_text("—")
+                self._update_output_measurements()
         except (ValueError, ZeroDivisionError):
             pass
         finally:
@@ -554,9 +747,11 @@ class UpscaylDialog(Gtk.Dialog):
             self.width_entry.set_text(str(w * factor))
             self.height_entry.set_text(str(h * factor))
             self._dimension_guard = False
-            self.output_ratio.set_text(f"{w / h:.2f}:1")
+            self._update_output_measurements()
         w, h = self._base_dimensions()
-        self.input_ratio.set_text(f"{w / h:.2f}:1")
+        self.input_ratio.set_text(self._long_short_ratio(w, h))
+        self._update_physical_dimensions(w, h, self.input_cm, self.input_units)
+        self._update_output_measurements()
 
     def _current_source(self):
         return self.sources[0] if self.sources else None
@@ -604,6 +799,7 @@ class UpscaylDialog(Gtk.Dialog):
             self.model_combo.append_text("No models found")
             self.model_combo.set_active(0)
             self.model_combo.set_sensitive(False)
+            self.model_description.set_markup("<small>No compatible model pair was found. Select a models folder under Advanced options.</small>")
             return
         self.model_combo.set_sensitive(True)
         for entry in entries:
@@ -612,6 +808,15 @@ class UpscaylDialog(Gtk.Dialog):
         self.model_combo.set_active(idx)
         self.model_combo.connect("changed", self._on_model_changed) if not getattr(self, "_model_signal_connected", False) else None
         self._model_signal_connected = True
+        self._update_model_description()
+
+    def _update_model_description(self):
+        idx = self.model_combo.get_active()
+        if idx < 0 or idx >= len(self._model_entries):
+            self.model_description.set_markup("<small>Select a model to see its intended use.</small>")
+            return
+        entry = self._model_entries[idx]
+        self.model_description.set_markup("<small>" + GLib.markup_escape_text(describe_model(entry[0]) if entry else "Select a model below this heading.") + "</small>")
 
     def _on_model_changed(self, combo):
         idx = combo.get_active()
@@ -621,6 +826,7 @@ class UpscaylDialog(Gtk.Dialog):
                 if entry is not None and i > idx:
                     combo.set_active(i)
                     return
+        self._update_model_description()
 
     def _on_check_installation(self, widget):
         # Comprehensive user-invoked health check. Run the external launch
@@ -657,13 +863,24 @@ class UpscaylDialog(Gtk.Dialog):
 
         threading.Thread(target=diagnostic_worker, daemon=True).start()
 
+    def _on_threads_default_toggled(self, button):
+        for spin in self.thread_spins:
+            spin.set_sensitive(not button.get_active())
+
+    def _thread_setting(self):
+        if self.threads_default.get_active():
+            return ""
+        return ":".join(str(spin.get_value_as_int()) for spin in self.thread_spins)
+
     def reset_controls(self):
         self.scale_buttons["4x"].set_active(True)
         self.custom_output_check.set_active(False)
         self.chain_button.set_active(True)
         self.output_layer_radio.set_active(True)
-        self.tile_entry.set_text("0")
-        self.threads_entry.set_text("")
+        self.tile_combo.set_active_id("0")
+        for spin, value in zip(self.thread_spins, (1, 2, 2)):
+            spin.set_value(value)
+        self.threads_default.set_active(True)
         self.tta_check.set_active(False)
         self._refresh_dimensions()
 
@@ -684,8 +901,8 @@ class UpscaylDialog(Gtk.Dialog):
             "model_dir": model_dir,
             "out_format": "png",
             "gpu_id": "",
-            "tile_size": self.tile_entry.get_text().strip(),
-            "threads": self.threads_entry.get_text().strip(),
+            "tile_size": self.tile_combo.get_active_id() or "0",
+            "threads": self._thread_setting(),
             "tta": self.tta_check.get_active(),
             "custom_model_dir": self._model_folder or "",
             "output": "image" if self.output_image_radio.get_active() else "layer",
@@ -1020,13 +1237,13 @@ def run_plugin(procedure, run_mode, image, drawables, config, run_data):
         )
         return procedure.new_return_values(Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error("No usable Upscayl installation or model is selected."))
 
-    if choice["tile_size"] and not choice["tile_size"].isdigit():
-        Gimp.message(f"Tile size must be a whole number (got '{choice['tile_size']}').")
-        return procedure.new_return_values(Gimp.PDBStatusType.CALLING_ERROR, GLib.Error("Tile size must be a whole number."))
+    if choice["tile_size"] not in ("0", "32", "64", "100", "128", "200", "256", "512"):
+        Gimp.message("Tile size must be automatic or one of the available validated sizes.")
+        return procedure.new_return_values(Gimp.PDBStatusType.CALLING_ERROR, GLib.Error("Invalid tile size."))
 
     if choice["threads"]:
         parts = choice["threads"].split(":")
-        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        if len(parts) != 3 or not all(p.isdigit() and 1 <= int(p) <= 64 for p in parts):
             Gimp.message(
                 f"Threads must be in load:proc:save form, e.g. 1:2:2 "
                 f"(got '{choice['threads']}')."
@@ -1237,7 +1454,7 @@ class UpscaylPlugin(Gimp.PlugIn):
             "system, Flatpak, or AppImage installs of Upscayl.",
             PLUGIN_ID,
         )
-        procedure.set_attribution("Zarir + Claude", "GPL-3.0", "2026")
+        procedure.set_attribution("Zarir Madon · OpenAI ChatGPT", "GPL-3.0", "2026")
         return procedure
 
 
