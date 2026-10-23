@@ -2,11 +2,54 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 Zarir Madon (https://www.zarirmadon.com)
 """
-rembg-gimp.py — Background removal plugin for GIMP 3.x using rembg.
+rembg-gimp.py — Remove Background for GIMP 3.2
+================================================
 
-Developed by Zarir Madon (https://www.zarirmadon.com) together with
-Claude Sonnet 5 (Anthropic), September 2026. Licensed under GPL-3.0 —
-see LICENSE in the repository root for the full text.
+DESIGN, CREATION AND DEVELOPMENT
+    Designed and created by: Zarir Madon
+    Website:                 https://www.zarirmadon.com
+    AI-assisted coding:      OpenAI GPT-6 (ChatGPT)
+    Earlier coding support:  Anthropic Claude Sonnet 5
+    Copyright (C) 2026 Zarir Madon.
+
+PLUGIN LICENCE
+    Released under the GNU General Public License, version 3.0 only
+    (GPL-3.0-only; SPDX: GPL-3.0-only).
+    You may use, study, modify and redistribute this plug-in under GPL-3.0.
+    This software is provided WITHOUT ANY WARRANTY, including the implied
+    warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the accompanying LICENSE file for the full licence terms.
+
+THIRD-PARTY ATTRIBUTIONS AND LICENCES
+    rembg             — Daniel Gatis and contributors; MIT License.
+                        https://github.com/danielgatis/rembg
+    ONNX Runtime      — Microsoft and contributors; MIT License.
+                        https://github.com/microsoft/onnxruntime
+    Pillow            — Pillow contributors; MIT-CMU License.
+                        https://github.com/python-pillow/Pillow
+    NumPy             — NumPy contributors; BSD 3-Clause (core project).
+                        https://github.com/numpy/numpy
+    SciPy             — SciPy contributors; BSD 3-Clause (core project).
+                        https://github.com/scipy/scipy
+    scikit-image      — scikit-image contributors; predominantly BSD-3-Clause,
+                        with additional notices for particular source files.
+                        https://github.com/scikit-image/scikit-image
+    PyMatting         — PyMatting contributors; MIT License (used in some
+                        rembg installations; not called directly here).
+                        https://github.com/pymatting/pymatting
+    GIMP / libgimp    — GIMP contributors; GPL-3.0-or-later.
+                        https://www.gimp.org/
+
+    These are independent upstream projects, not relicensed by this plugin.
+    Runtime libraries are imported from the user's installation; they are
+    not embedded or bundled in this source file. If distributing dependency
+    binaries, retain their corresponding copyright and licence notices.
+
+    Background-removal MODEL WEIGHTS are separate from the rembg library.
+    Each model may have its own copyright, usage restrictions and licence;
+    rembg's MIT licence does NOT grant rights to every model checkpoint.
+    Verify a selected model's own terms before redistributing its weights or
+    using it commercially.
 
 Install location:
     ~/.config/GIMP/3.2/plug-ins/rembg-gimp/rembg-gimp.py
