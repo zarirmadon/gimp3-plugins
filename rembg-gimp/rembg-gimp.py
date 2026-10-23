@@ -3,107 +3,40 @@
 # Copyright (C) 2026 Zarir Madon (https://www.zarirmadon.com)
 """
 rembg-gimp.py — Remove Background for GIMP 3.2
-================================================
 
-DESIGN, CREATION AND DEVELOPMENT
-    Designed and created by: Zarir Madon
-    Website:                 https://www.zarirmadon.com
-    AI-assisted coding:      OpenAI GPT-6 (ChatGPT)
-    Earlier coding support:  Anthropic Claude Sonnet 5
-    Copyright (C) 2026 Zarir Madon.
+Designed and created by Zarir Madon
+Website: https://www.zarirmadon.com
+AI-assisted coding: OpenAI GPT-6 (ChatGPT)
+Earlier coding support: Anthropic Claude Sonnet 5
+Copyright (C) 2026 Zarir Madon
+Licence: GPL-3.0-only
 
-PLUGIN LICENCE
-    Released under the GNU General Public License, version 3.0 only
-    (GPL-3.0-only; SPDX: GPL-3.0-only).
-    You may use, study, modify and redistribute this plug-in under GPL-3.0.
-    This software is provided WITHOUT ANY WARRANTY, including the implied
-    warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-    See the accompanying LICENSE file for the full licence terms.
+Third-party projects used by this plugin include rembg (MIT), ONNX Runtime
+(MIT), Pillow (MIT-CMU), NumPy (BSD-3-Clause), SciPy (BSD-3-Clause),
+scikit-image (BSD-style), PyMatting (MIT), and GIMP / libgimp
+(GPL-3.0-or-later).
 
-THIRD-PARTY ATTRIBUTIONS AND LICENCES
-    rembg             — Daniel Gatis and contributors; MIT License.
-                        https://github.com/danielgatis/rembg
-    ONNX Runtime      — Microsoft and contributors; MIT License.
-                        https://github.com/microsoft/onnxruntime
-    Pillow            — Pillow contributors; MIT-CMU License.
-                        https://github.com/python-pillow/Pillow
-    NumPy             — NumPy contributors; BSD 3-Clause (core project).
-                        https://github.com/numpy/numpy
-    SciPy             — SciPy contributors; BSD 3-Clause (core project).
-                        https://github.com/scipy/scipy
-    scikit-image      — scikit-image contributors; predominantly BSD-3-Clause,
-                        with additional notices for particular source files.
-                        https://github.com/scikit-image/scikit-image
-    PyMatting         — PyMatting contributors; MIT License (used in some
-                        rembg installations; not called directly here).
-                        https://github.com/pymatting/pymatting
-    GIMP / libgimp    — GIMP contributors; GPL-3.0-or-later.
-                        https://www.gimp.org/
-
-    These are independent upstream projects, not relicensed by this plugin.
-    Runtime libraries are imported from the user's installation; they are
-    not embedded or bundled in this source file. If distributing dependency
-    binaries, retain their corresponding copyright and licence notices.
-
-    Background-removal MODEL WEIGHTS are separate from the rembg library.
-    Each model may have its own copyright, usage restrictions and licence;
-    rembg's MIT licence does NOT grant rights to every model checkpoint.
-    Verify a selected model's own terms before redistributing its weights or
-    using it commercially.
-
-Install location:
-    ~/.config/GIMP/3.2/plug-ins/rembg-gimp/rembg-gimp.py
-
-The containing folder name MUST match the script name (minus .py) —
-GIMP 3.x plugin discovery requires this.
-
-After copying, make it executable:
-    chmod +x ~/.config/GIMP/3.2/plug-ins/rembg-gimp/rembg-gimp.py
-
-Then restart GIMP. Find it under: Filters > Distorts > Remove Background...
-
-Dependencies (must be importable by the SAME Python interpreter GIMP uses —
-see README.md for how to confirm this and for full CachyOS/Arch-specific
-install commands, since a plain `pip install rembg` often pulls in far more
-than you need):
-    sudo pacman -S --needed python-numpy python-pillow python-pip
-    sudo pacman -S --needed python-onnxruntime-cuda   # or -rocm for AMD, or -cpu for no GPU
-    python3 -m pip install --break-system-packages --no-deps rembg
-    # Optional dependencies depend on the installed rembg version; inspect its metadata.
-
-Models are downloaded only on explicit user request via model management.
-They are cached by rembg; checkpoint locations depend on the installed rembg
-version and environment. (Older rembg versions used ~/.u2net/ — that
-directory is still read for models downloaded previously, so upgrading
-never re-downloads what you already have.)
-
-Settings (model choice, edge mode, and all parameters) persist across GIMP
-sessions in ~/.config/GIMP/3.2/rembg-gimp-settings.json.
+Model weights may have separate licences and usage terms.
 """
 
-import gi
-gi.require_version('Gimp', '3.0')
-gi.require_version('GimpUi', '3.0')
-gi.require_version('Gegl', '0.4')
-from gi.repository import Gimp, GimpUi, GObject, GLib, Gegl, Gio, Gtk, GdkPixbuf, Gdk
-
-import sys
-import os
 import io
 import json
-import threading
-import tempfile
-import time
-import subprocess
+import os
 import signal
-import urllib.request
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 import urllib.error
+import urllib.request
 
+import gi
 
-# ---------------------------------------------------------------------------
-# Model catalogue — name, on-disk/download size, and a plain-language guide
-# for the selector help popup. Sizes are approximate.
-# ---------------------------------------------------------------------------
+gi.require_version('Gimp', '3.0')
+gi.require_version('GimpUi', '3.0')
+from gi.repository import Gdk, GdkPixbuf, Gio, Gimp, GimpUi, GLib, Gtk
+
 MODELS = [
     {
         "id": "u2net",
@@ -113,8 +46,7 @@ MODELS = [
             "The original general-purpose model. Good all-round choice for "
             "people, animals, and everyday objects on varied backgrounds. "
             "Slightly softer/blockier edges than isnet-general-use or "
-            "bria-rmbg on fine detail (hair, fur), but no commercial "
-            "licensing caveat — a safe default for commercial work."
+            "larger modern models on fine detail (hair, fur)."
         ),
     },
     {
@@ -165,8 +97,7 @@ MODELS = [
         "help": (
             "Newer architecture than u2net; sharp, clean edges on general "
             "subjects — product photography, objects, animals. A good "
-            "middle ground between u2net's speed and bria-rmbg's size, "
-            "with no commercial licensing caveat."
+            "middle ground between u2net's speed and heavier models."
         ),
     },
     {
@@ -190,7 +121,7 @@ MODELS = [
             "State-of-the-art edge precision for general subjects — best "
             "choice for demanding work (fine hair strands, semi-transparent "
             "or fuzzy edges) if you don't mind a large download and slower "
-            "inference. MIT-licensed, unlike bria-rmbg. Overkill for quick/"
+            "inference. Check each model's own licensing terms. Overkill for quick/"
             "batch work."
         ),
     },
@@ -269,13 +200,7 @@ MODELS = [
 MODELS.sort(key=lambda item: item["label"].casefold())
 
 MODEL_IDS = [m["id"] for m in MODELS]
-MODEL_LABELS = [m["label"] for m in MODELS]
 
-
-# ---------------------------------------------------------------------------
-# Edge modes — rembg's four ways to turn a mask into a cutout. These are
-# mutually exclusive (rembg applies at most one), not stackable.
-# ---------------------------------------------------------------------------
 EDGE_MODES = [
     {
         "id": "naive",
@@ -342,17 +267,7 @@ VITMATTE_CHECKPOINTS = [
 ]
 VITMATTE_CHECKPOINT_IDS = [c["id"] for c in VITMATTE_CHECKPOINTS]
 
-
-# ---------------------------------------------------------------------------
-# Models folder location — mirrors rembg's OWN path resolution logic
-# exactly (see rembg/sessions/base.py: legacy_home / rembg_home), rather
-# than hardcoding ~/.rembg. rembg checks, in order: U2NET_HOME env var
-# (legacy override, still honoured), then REMBG_HOME env var, then
-# XDG_DATA_HOME/rembg, then falls back to ~/.rembg. Individual model
-# files live under <home>/models/<model-name>/, not directly in <home>.
-# Getting this wrong would send the "Open models folder" button to an
-# empty or nonexistent directory for anyone who has these env vars set.
-# ---------------------------------------------------------------------------
+SHADOW_MODES = ("Off", "Subtle", "Natural", "Strong")
 
 def get_rembg_models_root():
     if os.getenv("U2NET_HOME"):
@@ -363,7 +278,6 @@ def get_rembg_models_root():
     models_dir = os.path.join(home, "models")
     return models_dir
 
-
 def get_rembg_legacy_models_root():
     """The pre-move flat directory (~/.u2net by default) — still read by
     rembg for models downloaded before the ~/.rembg/models/ layout, so
@@ -372,7 +286,6 @@ def get_rembg_legacy_models_root():
     return os.path.expanduser(
         os.getenv("U2NET_HOME",
                   os.path.join(os.getenv("XDG_DATA_HOME", "~"), ".u2net")))
-
 
 def model_cache_candidates(model_id):
     """Locate existing ONNX checkpoints without triggering rembg downloads."""
@@ -384,8 +297,7 @@ def model_cache_candidates(model_id):
         if root in seen or not os.path.isdir(root):
             continue
         seen.add(root)
-        # Current rembg stores models in per-model folders; older versions
-        # stored checkpoints directly under ~/.u2net.
+
         folders = [os.path.join(root, model_id), root]
         for folder in folders:
             if not os.path.isdir(folder):
@@ -405,10 +317,8 @@ def model_cache_candidates(model_id):
                 if os.path.isfile(candidate) and os.path.getsize(candidate) > 1024 * 1024:
                     yield candidate
 
-
 def find_cached_model(model_id):
     return next(model_cache_candidates(model_id), None)
-
 
 def resolve_raster_layer(image, drawables):
     """Accept the selected layer or its mask, preserving the owning layer."""
@@ -431,45 +341,12 @@ def resolve_raster_layer(image, drawables):
         return None
     return walk(image.get_layers())
 
-
-def open_folder_in_file_manager(path):
-    """
-    Opens `path` in the system's default file manager. Creates the
-    directory first if it doesn't exist yet (e.g. no model downloaded
-    through this plugin session), so the user gets a real, browsable
-    empty folder rather than an error. Uses GIMP/GLib's own
-    Gio.AppInfo.launch_default_for_uri, which is already cross-platform
-    (Linux/macOS/Windows) rather than hand-rolling per-OS subprocess
-    calls (xdg-open / open / explorer).
-    """
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError as e:
-        return False, f"Could not create/access folder: {e}"
-    try:
-        uri = Gio.File.new_for_path(path).get_uri()
-        Gio.AppInfo.launch_default_for_uri(uri, None)
-        return True, None
-    except GLib.Error as e:
-        return False, f"Could not open file manager: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Settings persistence — remembers the last-used model and all parameters
-# across GIMP sessions. Stored as plain JSON next to GIMP's own config, not
-# inside the plugin folder (which some package managers may treat as
-# read-only or wipe on plugin update).
-# ---------------------------------------------------------------------------
-
 SETTINGS_PATH = os.path.join(
     GLib.get_user_config_dir(), "GIMP", "3.2", "rembg-gimp-settings.json")
 
 DEFAULT_SETTINGS = {
     "model_id": "birefnet-general",
     "edge_mode": "naive",
-    "alpha_matting_foreground_threshold": 240,
-    "alpha_matting_background_threshold": 10,
-    "alpha_matting_erode_size": 10,
     "vitmatte_model": "small-distinctions-646",
     "post_process_mask": False,
     "only_mask": False,
@@ -480,7 +357,6 @@ DEFAULT_SETTINGS = {
     "advanced_expanded": True,
 }
 
-
 def load_settings():
     try:
         with open(SETTINGS_PATH, "r") as f:
@@ -488,10 +364,7 @@ def load_settings():
         settings = dict(DEFAULT_SETTINGS)
         settings.update({k: v for k, v in saved.items()
                           if k in DEFAULT_SETTINGS})
-        # Guard against a stale saved model_id/edge_mode/vitmatte_model that
-        # no longer exists (e.g. after this plugin is updated and a model
-        # is renamed or removed) — fall back to the default rather than
-        # crashing the dialog on an invalid combo index.
+
         if settings["model_id"] not in MODEL_IDS:
             settings["model_id"] = DEFAULT_SETTINGS["model_id"]
         if settings["edge_mode"] not in EDGE_MODE_IDS:
@@ -509,40 +382,16 @@ def load_settings():
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return dict(DEFAULT_SETTINGS)
 
-
 def save_settings(settings):
     try:
         os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
         with open(SETTINGS_PATH, "w") as f:
             json.dump(settings, f, indent=2)
     except OSError:
-        # Non-fatal: settings just won't persist this time. Don't interrupt
-        # the user's actual background-removal workflow over this.
+
         pass
 
-
-# ---------------------------------------------------------------------------
-# Parameter definitions with hover help text (rembg's `remove()` kwargs)
-# ---------------------------------------------------------------------------
 PARAM_HELP = {
-    "alpha_matting_foreground_threshold": (
-        "0-255. Pixels with an initial mask confidence above this value "
-        "are treated as 'definitely foreground' seeds for the matting "
-        "algorithm. Higher = more conservative (only very confident "
-        "pixels seed the foreground), which can shrink thin details. "
-        "Default 240."
-    ),
-    "alpha_matting_background_threshold": (
-        "0-255. Pixels with mask confidence below this value are treated "
-        "as 'definitely background' seeds. Lower = more conservative "
-        "about calling something background. Default 10."
-    ),
-    "alpha_matting_erode_size": (
-        "Pixel radius used to erode the foreground/background seed masks "
-        "before matting, creating an 'unknown' region for the algorithm to "
-        "resolve. Larger values give the matting algorithm more room to "
-        "work on soft edges (e.g. hair) but cost more time. Default 10."
-    ),
     "only_mask": (
         "Output the alpha mask itself (as a greyscale image) instead of "
         "the cutout RGBA image. Useful if you want to hand-edit the mask "
@@ -555,24 +404,7 @@ PARAM_HELP = {
         "quality improvement with negligible extra cost; occasionally "
         "over-smooths fine detail like individual hair strands."
     ),
-    "background_color": (
-        "Instead of transparency, composite the cutout over a solid RGBA "
-        "colour. Leave disabled to keep a transparent background (normal "
-        "use case for compositing in GIMP)."
-    ),
 }
-
-
-
-# ---------------------------------------------------------------------------
-# rembg version check — queries PyPI for the latest published version and
-# compares against what's installed. Does NOT run pip itself; only tells
-# the user what command to run and copies/shows it, since silently
-# upgrading a package GIMP has already imported this session is unsafe
-# (Python doesn't reliably re-import an upgraded package without a
-# restart) and an unattended upgrade could change rembg's own behaviour
-# with no one there to notice if something breaks.
-# ---------------------------------------------------------------------------
 
 def get_installed_rembg_version():
     try:
@@ -580,7 +412,6 @@ def get_installed_rembg_version():
         return getattr(_rembg_mod, "__version__", "unknown")
     except ImportError:
         return None
-
 
 def get_latest_pypi_version(package_name, timeout_seconds=6):
     """
@@ -600,7 +431,6 @@ def get_latest_pypi_version(package_name, timeout_seconds=6):
             json.JSONDecodeError, KeyError, TimeoutError, OSError):
         return None
 
-
 def build_upgrade_command():
     """
     The exact pip command the user should run themselves. Deliberately
@@ -609,64 +439,6 @@ def build_upgrade_command():
     --no-deps was specifically chosen to avoid.
     """
     return f"{sys.executable} -m pip install --break-system-packages --upgrade --no-deps rembg"
-
-
-# ---------------------------------------------------------------------------
-# CPU / GPU execution provider detection
-# ---------------------------------------------------------------------------
-
-_GPU_PROVIDERS = (
-    "CUDAExecutionProvider",
-    "ROCMExecutionProvider",
-    "TensorrtExecutionProvider",
-    "DmlExecutionProvider",       # DirectML (Windows, irrelevant on CachyOS
-                                   # but harmless to check)
-    "OpenVINOExecutionProvider",
-)
-
-_gpu_notice_shown = False  # only nag once per GIMP session
-
-
-def detect_execution_provider():
-    """
-    Returns (active_provider_str, is_gpu_bool, advice_str_or_None).
-    advice_str is a ready-to-show install hint, only populated when no GPU
-    provider is available at all.
-    """
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        return "unknown (onnxruntime not importable)", False, None
-
-    available = ort.get_available_providers()
-    gpu_available = [p for p in available if p in _GPU_PROVIDERS]
-
-    if gpu_available:
-        # onnxruntime uses the first provider in its priority list that's
-        # available; rembg lets it pick automatically, so report the
-        # highest-priority GPU provider found as "active".
-        active = gpu_available[0]
-        return active, True, None
-
-    advice = (
-        "rembg/onnxruntime is running on CPU only — no GPU execution "
-        "provider was found. This works fine but is noticeably slower, "
-        "especially with the larger models (isnet, sam, birefnet-*).\n\n"
-        "To enable GPU acceleration on CachyOS/Arch:\n"
-        "  • NVIDIA (CUDA): sudo pacman -S python-onnxruntime-cuda\n"
-        "  • AMD (ROCm):    sudo pacman -S python-onnxruntime-rocm\n"
-        "    (or python-onnxruntime-opt-rocm, which adds AVX2 CPU "
-        "optimizations alongside ROCm)\n\n"
-        "Only one onnxruntime variant should be installed at a time — "
-        "remove the plain 'python-onnxruntime' (or pip 'onnxruntime') "
-        "first if switching, since they conflict."
-    )
-    return "CPUExecutionProvider", False, advice
-
-
-# ---------------------------------------------------------------------------
-# Core conversion helpers: GIMP layer <-> PIL Image, bit-depth aware
-# ---------------------------------------------------------------------------
 
 def layer_to_pil(layer):
     """Export only the selected layer, never the entire visible composition.
@@ -686,7 +458,7 @@ def layer_to_pil(layer):
     temp_image = None
     export_path = None
     try:
-        # Gimp.Image.new / Layer.new_from_drawable are public GIMP 3 APIs.
+
         temp_image = Gimp.Image.new(width, height, Gimp.ImageBaseType.RGB)
         temp_layer = Gimp.Layer.new_from_drawable(layer, temp_image)
         temp_image.insert_layer(temp_layer, None, 0)
@@ -713,7 +485,6 @@ def layer_to_pil(layer):
             except FileNotFoundError:
                 pass
 
-
 def pil_mask_to_new_layer(image, original_layer, alpha_mask_pil, layer_name):
     """
     Take the alpha channel produced by rembg (as a PIL 'L' mask, same pixel
@@ -737,8 +508,7 @@ def pil_mask_to_new_layer(image, original_layer, alpha_mask_pil, layer_name):
     mask_load_image = None
     success = False
     try:
-        # Nearest-neighbour resizing is intentional: inference output is
-        # expected to match source dimensions, not be silently rescaled.
+
         if alpha_mask_pil.size != (width, height):
             raise ValueError("Inference mask dimensions do not match source layer")
         alpha_mask_pil.convert("L").save(mask_tmp_path)
@@ -770,24 +540,9 @@ def pil_mask_to_new_layer(image, original_layer, alpha_mask_pil, layer_name):
         except FileNotFoundError:
             pass
 
-    # NOTE: Gimp.Layer has no apply_mask() method — that was a guess that
-    # doesn't exist in the 3.x API. The real equivalent is
-    # layer.remove_mask(Gimp.MaskApplyMode.APPLY), which bakes the mask
-    # into the layer's alpha channel and deletes the mask object.
-    # Deliberately NOT doing that here: leaving the mask live and editable
-    # is more useful for a background-removal result, since it lets you
-    # hand-touch-up the cutout edge non-destructively afterwards (paint on
-    # the mask in black/white) rather than having it already flattened.
-    # Clear the selection so it doesn't linger visibly on the new layer.
     Gimp.displays_flush()
     return new_layer
 
-
-# ---------------------------------------------------------------------------
-# Background removal worker (runs off the UI thread)
-# ---------------------------------------------------------------------------
-
-# Separate inference process: ONNX/Numba never execute in GIMP's UI process.
 _INFERENCE_SCRIPT = r'''
 import json, sys, traceback, time
 from PIL import Image
@@ -811,8 +566,6 @@ try:
     with Image.open(src) as im:
         result = remove(im.convert("RGBA"), **kw)
     if isinstance(result, list):
-        # Clothing segmentation returns multiple category masks. Combine
-        # their foreground coverage for background removal.
         from PIL import ImageChops
         masks = [item.convert("L") for item in result]
         if not masks:
@@ -826,9 +579,6 @@ try:
             foreground = im.convert("RGBA")
             foreground.putalpha(merged)
             result = foreground
-    # Edge Style is separate from rembg Edge Refinement. Fine is the
-    # default and leaves model fine detail untouched. Other styles apply
-    # controlled alpha-only adjustments; RGB stays from original pixels.
     style = p.get("edge_style", "Fine")
     if style in ("Smooth", "Crisp", "Feathered"):
         from PIL import ImageFilter
@@ -849,13 +599,6 @@ try:
         else:
             rgba.putalpha(alpha)
             result = rgba
-    # Cast shadows do not belong to the foreground segmentation mask.
-    # Recover them independently from the ORIGINAL source, and store them
-    # as a dark transparent overlay so that they remain shadows when the
-    # subject is placed over another background (rather than pale fringes).
-    # This conservative method intentionally only handles light, nearly
-    # uniform backgrounds. For complex photographs, don't hallucinate a
-    # shadow from background texture or nearby dark objects.
     shadow_mode = p.get("shadow_preservation", "Off")
     if shadow_mode != "Off" and not p.get("only_mask", False):
         phase("Recovering source cast shadows")
@@ -867,9 +610,6 @@ try:
             source_rgba = source.convert("RGBA")
         fg_alpha_full = result.convert("RGBA").getchannel("A")
         width, height = source_rgba.size
-        # Bound the expensive spatial analysis. Upscaling only the detected
-        # shadow alpha afterward prevents 4K+ source dimensions from causing
-        # disproportionate mask-analysis cost.
         factor = min(1.0, 1152.0 / max(width, height))
         work_size = (max(1, round(width * factor)),
                      max(1, round(height * factor)))
@@ -899,9 +639,6 @@ try:
             samples = np.asarray(background_samples, dtype=np.float32)
             bg = np.median(samples, axis=0)
             bg_luma = float(np.mean(bg))
-            # Large disagreement between corners, dark backgrounds, or
-            # distinctly chromatic backdrops are too ambiguous to recover
-            # using an automatic neutral-shadow model.
             plausible = (bg_luma >= 205 and
                          float(np.max(np.ptp(samples, axis=0))) <= 14 and
                          float(np.ptp(bg)) <= 16 and
@@ -910,22 +647,14 @@ try:
                 rgb = pix[:, :, :3].astype(np.float32)
                 deficit_rgb = bg.reshape((1, 1, 3)) - rgb
                 darkness = np.maximum(0, np.mean(deficit_rgb, axis=2))
-                # Neutral cast shadows darken each colour channel similarly.
-                # This suppresses saturated illustrations and colored props
-                # mistakenly omitted by the foreground model.
                 chroma = np.ptp(deficit_rgb, axis=2)
                 neutral = np.clip((22.0 - chroma) / 16.0, 0.0, 1.0)
-                # The darker a candidate is, the less likely it is a soft
-                # cast shadow rather than a different background object.
                 soft_region = np.clip((125.0 - darkness) / 42.0, 0.0, 1.0)
                 dist = distance_transform_edt(alpha_arr < 128)
                 falloff_radius = max(12.0, min(sw, sh) * 0.065)
                 vicinity = np.exp(-0.5 * (dist / falloff_radius) ** 2)
-                # Genuine shadow regions are mostly outside the subject.
                 outside = np.clip((255.0 - alpha_arr.astype(np.float32)) / 190.0,
                                   0.0, 1.0)
-                # Preserve the actual observed darkness. The modes change
-                # shadow contrast; Off never creates a shadow layer.
                 power = {"Subtle": 0.80, "Natural": 1.45,
                          "Strong": 2.65}.get(shadow_mode, 0.0)
                 intensity = np.maximum(0.0, darkness - 2.0)
@@ -937,8 +666,6 @@ try:
                 shadow_a = shadow_a.filter(ImageFilter.GaussianBlur(0.8))
                 if work_size != (width, height):
                     shadow_a = shadow_a.resize((width, height), Image.Resampling.BICUBIC)
-                # Only create a layer if recoverable shadows exist at a
-                # visible level; avoid empty layers on clean backgrounds.
                 if shadow_a.getbbox() and shadow_a.getextrema()[1] >= 12:
                     shadow_rgba = Image.new("RGBA", (width, height), (24, 23, 24, 0))
                     shadow_rgba.putalpha(shadow_a)
@@ -949,7 +676,6 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 '''
-
 
 class DownwardModelPicker(Gtk.Box):
     """In-panel expanding model list; never floats above or outside the dialog."""
@@ -968,8 +694,7 @@ class DownwardModelPicker(Gtk.Box):
         self.pack_start(self.revealer, False, False, 0)
         self.scroll = Gtk.ScrolledWindow()
         self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        # Show the entire catalogue when room permits; otherwise scroll.
-        # Avoid GTK popovers, which can flip above the selector.
+
         display = Gdk.Display.get_default()
         mon = display.get_primary_monitor() if display else None
         work_height = mon.get_workarea().height if mon else 800
@@ -1042,9 +767,8 @@ def _stop_worker_process(proc, grace_seconds=1.0):
         else:
             proc.wait(timeout=0)
     except (OSError, subprocess.TimeoutExpired, ProcessLookupError, ChildProcessError):
-        # Cleanup must not throw from a GTK destroy/response signal.
-        pass
 
+        pass
 
 class InferenceJob:
     """One cancellable worker, polled by GTK without a nested event loop."""
@@ -1081,8 +805,7 @@ class InferenceJob:
                     start_new_session=(os.name == "posix"))
             self.source_id = GLib.timeout_add(120, self._poll)
         except Exception:
-            # A failure after Popen (for example GLib.timeout_add) must not
-            # orphan an inference worker when the dialog never opens.
+
             _stop_worker_process(self.process)
             self.directory.cleanup()
             raise
@@ -1098,11 +821,7 @@ class InferenceJob:
             except (ValueError, GLib.Error):
                 pass
             self.source_id = None
-        # Reaping an inference process can take seconds (SIGTERM grace and
-        # SIGKILL fallback). Never wait for it in a GTK response/destroy
-        # handler: detach the cleanup into a plain Python thread. The GLib
-        # polling source was removed above, so no callback can access the
-        # temporary files while cleanup runs.
+
         proc, directory = self.process, self.directory
         def reap_cancelled_worker():
             try:
@@ -1117,8 +836,7 @@ class InferenceJob:
 
     def _poll(self):
         if self.process.poll() is None:
-            # Small worker log, read without blocking; reports genuine stages,
-            # not fabricated percent-complete values.
+
             try:
                 with open(self.log_path, encoding="utf-8", errors="replace") as f:
                     for line in f:
@@ -1129,7 +847,7 @@ class InferenceJob:
             return True
         if self.process.poll() is None:
             return True
-        self.source_id = None  # GLib removes this callback when it returns False
+        self.source_id = None
         result, error = None, None
         try:
             if self.cancelled:
@@ -1152,18 +870,12 @@ class InferenceJob:
         try:
             self.finished(result, error)
         except Exception as exc:
-            # Never propagate an inference completion exception through a
-            # GLib source callback; report it without destabilising GTK.
+
             try:
                 Gimp.message("rembg completion failed: " + str(exc))
             except Exception:
                 pass
         return False
-
-
-# ---------------------------------------------------------------------------
-# Dialog UI
-# ---------------------------------------------------------------------------
 
 class RembgDialog(Gtk.Dialog):
     """Native GTK layout based on the user's upscayl-gimp.py dialog.
@@ -1172,13 +884,12 @@ class RembgDialog(Gtk.Dialog):
     """
     def __init__(self, image, layer):
         Gtk.Dialog.__init__(self, title="Remove Background — GIMP")
-        # GTK3 display API, no deprecated Gdk.Screen monitor methods.
+
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() if display else None
         if monitor is None and display and display.get_n_monitors():
             monitor = display.get_monitor(0)
-        # Target the available monitor work area, not a small fixed dialog.
-        # Leave a modest safety margin for the window manager decorations.
+
         if monitor is not None:
             work = monitor.get_workarea()
             self.set_default_size(min(1240, max(800, int(work.width * .94))),
@@ -1187,7 +898,6 @@ class RembgDialog(Gtk.Dialog):
             self.set_default_size(1160, 850)
         self.set_resizable(True)
         self.image, self.layer = image, layer
-        self.result_pil, self._preview_result_pil = None, None
         self._closed, self._job, self._apply_result = False, None, False
         self._pending_start = None
         self._activity_timer = None
@@ -1199,14 +909,12 @@ class RembgDialog(Gtk.Dialog):
         self._thumbnail_error = None
         self.split_fraction = 0.50
         self.zoom = 1.0
-        self.subject = "Person"
         self.quality = self.settings.get("quality", "Fine")
         self.edge_style = self.settings.get("edge_style", "Fine")
         self.output_mode = self.settings.get("output_mode", "New layer")
         self.connect("response", self._on_dialog_response)
         self.connect("destroy", self._on_destroy)
-        # Follow GIMP's active GTK theme. Limit custom styling to the selected
-        # choice state; do not install an application-wide dark palette.
+
         css = Gtk.CssProvider()
         css.load_from_data(b"""
         .rb-choice:checked {
@@ -1262,7 +970,6 @@ class RembgDialog(Gtk.Dialog):
         left.set_border_width(6)
         left.get_style_context().add_class("rb-panel")
         left_scroll.add(left)
-        self._model_override = True
         model_heading = Gtk.Label(label="MODEL")
         model_heading.set_xalign(0)
         model_heading.get_style_context().add_class("rb-section")
@@ -1298,9 +1005,9 @@ class RembgDialog(Gtk.Dialog):
         shadow_label.get_style_context().add_class("rb-section")
         left.pack_start(shadow_label, False, False, 0)
         self.shadow_combo = Gtk.ComboBoxText()
-        for mode in ("Off", "Subtle", "Natural", "Strong"):
+        for mode in SHADOW_MODES:
             self.shadow_combo.append_text(mode)
-        self.shadow_combo.set_active(("Off", "Subtle", "Natural", "Strong").index(
+        self.shadow_combo.set_active(SHADOW_MODES.index(
             self.settings.get("shadow_preservation", "Off")))
         self.shadow_combo.set_tooltip_text(
             "Recover soft cast shadows from light, uniform source backgrounds. "
@@ -1320,7 +1027,6 @@ class RembgDialog(Gtk.Dialog):
         self.advanced.set_tooltip_text("All model and mask-processing parameters")
         advanced_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         advanced_box.set_border_width(8)
-        self.alpha_matting_params_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.vitmatte_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.vitmatte_combo = Gtk.ComboBoxText()
         for item in VITMATTE_CHECKPOINTS:
@@ -1332,7 +1038,7 @@ class RembgDialog(Gtk.Dialog):
         self.chk_post_process = self._checkbox_row(advanced_box, "Post-process mask", PARAM_HELP["post_process_mask"], self.settings["post_process_mask"])
         self.chk_only_mask = self._checkbox_row(advanced_box, "Mask only", PARAM_HELP["only_mask"], self.settings["only_mask"])
         self.update_check_btn = Gtk.Button(label="Installation & Diagnostics")
-        self.update_check_btn.connect("clicked", self.on_combined_diagnostics_clicked)
+        self.update_check_btn.connect("clicked", self.on_diagnostics_clicked)
         self.update_check_btn.set_tooltip_text("Check dependencies and display INSTALL / UNINSTALL instructions. Update checking is manual only.")
         advanced_box.pack_start(self.update_check_btn, False, False, 0)
         self.manual_update_btn = Gtk.Button(label="Check rembg Updates (online)")
@@ -1348,8 +1054,7 @@ class RembgDialog(Gtk.Dialog):
             ("New layer", "New layer"),
             ("New image", "New image")], 2, self.output_mode, "output_mode",
             self._choice_changed, "Choose a new masked layer in this image or a separate new image")
-        # Same structure as upscayl-gimp.py: advanced options follow the
-        # principal controls rather than hiding a final output selector.
+
         left.pack_start(self.advanced, False, False, 0)
 
         body.pack1(left_scroll, resize=True, shrink=True)
@@ -1388,7 +1093,6 @@ class RembgDialog(Gtk.Dialog):
         self.progress = Gtk.ProgressBar()
         self.progress.set_show_text(True)
         content.pack_start(self.progress, False, False, 0)
-        self._model_override = True
         self._model_overridden(self.model_combo)
         self._choice_changed(None)
         content.show_all()
@@ -1396,13 +1100,9 @@ class RembgDialog(Gtk.Dialog):
         self.edge_mode_combo.connect("changed", self.on_edge_mode_changed)
         self._update_edge_mode_visibility()
         body.set_position(525)
-        # No eager image export, dependency scans or model imports at startup.
-        # Large layers must not delay the initial GTK window paint.
+
         self.model_ready_label.set_text("Ready to preview")
-        # Retrieve the selected layer's thumbnail only AFTER the window is
-        # mapped. An idle source scheduled during construction can run before
-        # the drawing area has a mapped GdkWindow on some GTK/GIMP setups.
-        # The bounded GIMP thumbnail API avoids full-resolution PNG export.
+
         self.connect("map", self._on_preview_window_mapped)
 
     def _advanced_row(self, parent, caption, widget):
@@ -1445,21 +1145,16 @@ class RembgDialog(Gtk.Dialog):
             callback(button)
 
     def _choice_changed(self, _button):
-        # Edge Refinement is independent of Edge Style and Quality. Changing
-        # a radio button must never silently reset the selected refinement.
+
         if hasattr(self, "preview_canvas"):
             self.preview_canvas.queue_draw()
 
     def _model_overridden(self, _combo):
-        self._model_override = True
         idx = self.model_combo.get_active()
         if idx >= 0 and hasattr(self, "model_description"):
             description = MODELS[idx]["help"]
             self.model_description.set_text(description)
             self.model_description.set_tooltip_text(description)
-
-    def on_combined_diagnostics_clicked(self, button):
-        self.on_diagnostics_clicked(button)
 
     def _set_zoom(self, _button, factor):
         self.zoom = 1.0 if factor == 0 else max(0.2, min(8.0, self.zoom * factor))
@@ -1479,15 +1174,11 @@ class RembgDialog(Gtk.Dialog):
     def _draw_preview(self, widget, cr):
         import math
         w, h = widget.get_allocated_width(), widget.get_allocated_height()
-        # Match the host GTK theme rather than forcing a blue/navy panel.
-        # Gtk.StyleContext.get_background_color() is deprecated in GTK3.
-        # GTK paints the actual theme background, including themes that use
-        # gradients/images rather than a solid CSS background-color.
+
         try:
             widget.get_style_context().render_background(cr, 0, 0, w, h)
         except Exception:
-            # The preview must still paint if an unusual GTK theme rejects
-            # render_background; never let theme drawing hide the image.
+
             pass
         before = self.preview_pixbuf_before
         after = self.preview_pixbuf_after
@@ -1554,7 +1245,6 @@ class RembgDialog(Gtk.Dialog):
         self.chk_post_process.set_active(False)
         self.chk_only_mask.set_active(False)
         self._update_edge_mode_visibility()
-        self._model_override = True
         self.quality_buttons["Fine"].set_active(True)
         self.edge_buttons["Fine"].set_active(True)
         self.output_buttons["New layer"].set_active(True)
@@ -1629,23 +1319,7 @@ class RembgDialog(Gtk.Dialog):
                       "The Python interpreter running GIMP must see the installed packages."])
         return "\n".join(lines), missing
 
-    def _startup_diagnostics(self):
-        if self._closed:
-            return False
-        try:
-            _, missing = self._diagnostics_report()
-            if missing:
-                self.status_label.set_text("Missing dependencies — open diagnostics")
-                self.model_ready_label.set_text("⚠  rembg needs attention")
-                self.on_diagnostics_clicked(None, alert=True)
-            else:
-                self.status_label.set_text("Ready — dependencies found; CPU inference not yet tested")
-                self.model_ready_label.set_text("✓  rembg ready")
-        except Exception as exc:
-            self.status_label.set_text("Diagnostics failed: " + str(exc))
-        return False
-
-    def on_diagnostics_clicked(self, _button, alert=False):
+    def on_diagnostics_clicked(self, _button):
         report, missing = self._diagnostics_report()
         dialog = Gtk.Dialog(title="Remove Background — Installation Diagnostics",
                             transient_for=self, modal=True)
@@ -1677,8 +1351,6 @@ class RembgDialog(Gtk.Dialog):
         dialog.run()
         dialog.destroy()
 
-    # -- UI helper builders -------------------------------------------
-
     def _checkbox_row(self, box, label, help_text, default=False):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         chk = Gtk.CheckButton(label=label)
@@ -1688,44 +1360,12 @@ class RembgDialog(Gtk.Dialog):
         box.pack_start(row, False, False, 0)
         return chk
 
-    def _spin_row(self, box, label, help_text, lo, hi, default):
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl = Gtk.Label(label=label)
-        lbl.set_tooltip_text(help_text)
-        adj = Gtk.Adjustment(value=default, lower=lo, upper=hi,
-                              step_increment=1, page_increment=10)
-        spin = Gtk.SpinButton(adjustment=adj)
-        spin.set_tooltip_text(help_text)
-        row.pack_start(lbl, True, True, 0)
-        row.pack_start(spin, False, False, 0)
-        box.pack_start(row, False, False, 0)
-        return spin
-
     def on_edge_mode_changed(self, combo):
         self._update_edge_mode_visibility()
 
     def _update_edge_mode_visibility(self):
         edge_mode = self._current_edge_mode_id()
-        self.alpha_matting_params_box.set_visible(False)
         self.vitmatte_row.set_visible(edge_mode == "vitmatte")
-
-    def on_model_help_clicked(self, btn):
-        dlg = Gtk.MessageDialog(
-            transient_for=self, flags=0,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text="Which model should I use?"
-        )
-        dlg.add_button("Download Models…", 1001)
-        lines = []
-        for m in MODELS:
-            lines.append(f"• {m['label']}  [{m['size']}]\n   {m['help']}\n")
-        dlg.format_secondary_text("\n".join(lines))
-        dlg.set_default_size(600, 500)
-        response = dlg.run()
-        dlg.destroy()
-        if response == 1001:
-            self.on_download_models_clicked()
 
     def on_download_models_clicked(self):
         dlg = Gtk.Dialog(title="Download Models", transient_for=self, modal=True)
@@ -1838,41 +1478,6 @@ class RembgDialog(Gtk.Dialog):
         dlg.show_all()
         return False
 
-    def on_open_models_folder_clicked(self, btn):
-        models_root = get_rembg_models_root()
-        # If the primary (current-layout) folder doesn't exist yet, but
-        # the legacy ~/.u2net folder does, open that instead — most
-        # likely case is a fresh plugin install where no model has been
-        # downloaded THROUGH THIS SESSION yet, but older models exist
-        # under the legacy path rembg still reads from.
-        target = models_root
-        if not os.path.isdir(models_root):
-            legacy = get_rembg_legacy_models_root()
-            if os.path.isdir(legacy):
-                target = legacy
-
-        success, error = open_folder_in_file_manager(target)
-        if not success:
-            Gimp.message(
-                f"Couldn't open the models folder automatically.\n\n"
-                f"Location: {target}\n\nError: {error}"
-            )
-
-    def on_edge_mode_help_clicked(self, btn):
-        dlg = Gtk.MessageDialog(
-            transient_for=self, flags=0,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text="Which edge mode should I use?"
-        )
-        lines = []
-        for em in EDGE_MODES:
-            lines.append(f"• {em['label']}\n   {em['help']}\n")
-        dlg.format_secondary_text("\n".join(lines))
-        dlg.set_default_size(600, 500)
-        dlg.run()
-        dlg.destroy()
-
     def on_check_updates_clicked(self, btn):
         self.update_check_btn.set_sensitive(False)
         self.update_status_label.set_text("Checking...")
@@ -1904,15 +1509,6 @@ class RembgDialog(Gtk.Dialog):
                 "<span foreground='#78d99a'>" + GLib.markup_escape_text(f"Up to date (rembg {installed}).") + "</span>")
             return False
 
-        # An update is available. Never run pip ourselves — show the exact
-        # command and let the user run it, since:
-        #  1. GIMP has already imported this session's rembg module, and
-        #     Python doesn't reliably pick up an upgraded package without
-        #     restarting the process that imported it, so an in-place
-        #     upgrade wouldn't take effect until GIMP is restarted anyway.
-        #  2. Running package-manager commands on the user's system without
-        #     an explicit, visible confirmation step isn't something this
-        #     plugin should do quietly.
         cmd = build_upgrade_command()
         self.update_status_label.set_markup(
             "<span foreground='#ff6666'>" + GLib.markup_escape_text(f"Update available: {installed} → {latest}") + "</span>")
@@ -1935,9 +1531,6 @@ class RembgDialog(Gtk.Dialog):
         )
         dlg.set_default_size(560, 260)
 
-        # Make the command easy to copy: a selectable, read-only entry
-        # field the user can click into and Ctrl+C, since MessageDialog's
-        # secondary text often isn't selectable in all GTK themes.
         entry = Gtk.Entry()
         entry.set_text(cmd)
         entry.set_editable(False)
@@ -1949,8 +1542,6 @@ class RembgDialog(Gtk.Dialog):
         dlg.run()
         dlg.destroy()
         return False
-
-    # -- Preview handling ------------------------------------------------
 
     def _on_preview_window_mapped(self, *_args):
         """Request the initial preview after GTK has mapped the dialog."""
@@ -1978,10 +1569,6 @@ class RembgDialog(Gtk.Dialog):
         except Exception as exc:
             problems.append("drawable thumbnail: " + str(exc))
 
-        # Some precision/format combinations fail to create a pixbuf even
-        # though the underlying GIMP thumbnail data was produced correctly.
-        # Construct one from the documented RGB[A] GBytes without copying a
-        # full-resolution layer. Keep its GBytes alive through the pixbuf.
         if thumb is None:
             try:
                 payload = self.layer.get_thumbnail_data(768, 768)
@@ -1996,9 +1583,6 @@ class RembgDialog(Gtk.Dialog):
             except Exception as exc:
                 problems.append("drawable thumbnail data: " + str(exc))
 
-        # This fallback is only equivalent to a layer thumbnail when the
-        # document has a single layer; never silently show a composite of
-        # unrelated layers as the selected-layer source.
         if thumb is None:
             try:
                 if len(self.image.get_layers()) == 1:
@@ -2019,14 +1603,6 @@ class RembgDialog(Gtk.Dialog):
             self.preview_canvas.queue_draw()
             print("rembg-gimp: " + self._thumbnail_error, file=sys.stderr)
         return False
-
-    def _scale_for_preview(self, pixbuf, max_dim=320):
-        w, h = pixbuf.get_width(), pixbuf.get_height()
-        scale = min(max_dim / w, max_dim / h, 1.0)
-        if scale < 1.0:
-            pixbuf = pixbuf.scale_simple(int(w * scale), int(h * scale),
-                                          GdkPixbuf.InterpType.BILINEAR)
-        return pixbuf
 
     def _current_model_id(self):
         idx = self.model_combo.get_active()
@@ -2128,7 +1704,7 @@ class RembgDialog(Gtk.Dialog):
             return False
         try:
             self.status_label.set_text("Exporting selected layer at full resolution…")
-            source, self._high_bit_depth, _ = layer_to_pil(self.layer)
+            source, _, _ = layer_to_pil(self.layer)
             if self._closed:
                 return False
             self._job = InferenceJob(source, self._apply_model,
@@ -2157,7 +1733,7 @@ class RembgDialog(Gtk.Dialog):
             self.status_label.set_text("Preparing full-resolution source; this may take a moment…")
             self.get_widget_for_response(Gtk.ResponseType.OK).set_sensitive(False)
             self.preview_btn.set_sensitive(False)
-            # Let GTK paint the busy state before GIMP's synchronous export.
+
             self._pending_start = GLib.timeout_add(80, self._start_apply_idle)
             self._begin_activity()
         elif response in (Gtk.ResponseType.CANCEL, Gtk.ResponseType.DELETE_EVENT):
@@ -2221,10 +1797,7 @@ class RembgDialog(Gtk.Dialog):
                     image, target_layer, alpha,
                     self.layer.get_name() + " (bg removed)")
                 if recovered_shadow is not None:
-                    # The source-colour subject and editable mask stay at
-                    # their original precision. Shadow RGB/alpha live in a
-                    # separate layer directly BELOW the cutout, so the cast
-                    # shadow remains dark even on non-white backgrounds.
+
                     shadow_layer = self._import_recovered_shadow(
                         image, foreground_layer, recovered_shadow)
             except Exception:
@@ -2286,13 +1859,6 @@ class RembgDialog(Gtk.Dialog):
         self._job = None
         self._on_preview_ready(result, str(error) if error else None)
 
-    def _set_status(self, msg):
-        if self._closed:
-            return False
-        self.status_label.set_text(msg)
-        self.progress.pulse()
-        return False
-
     def _on_preview_ready(self, result_pil, error):
         self.get_widget_for_response(Gtk.ResponseType.OK).set_sensitive(True)
         if self._closed:
@@ -2337,13 +1903,7 @@ class RembgDialog(Gtk.Dialog):
             return False
         self.preview_pixbuf_after = pixbuf
         self.preview_canvas.queue_draw()
-        self._preview_result_pil = result_pil
         return False
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
 
 class RembgPlugin(Gimp.PlugIn):
     def do_set_i18n(self, name):
@@ -2388,6 +1948,5 @@ class RembgPlugin(Gimp.PlugIn):
         return procedure.new_return_values(
             Gimp.PDBStatusType.SUCCESS if success else Gimp.PDBStatusType.CANCEL,
             GLib.Error())
-
 
 Gimp.main(RembgPlugin.__gtype__, sys.argv)
