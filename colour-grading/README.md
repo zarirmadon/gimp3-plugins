@@ -6,7 +6,8 @@
 
 Whether you're warming the last light of a landscape, shaping a cinematic portrait, rescuing a colour cast or inventing a look entirely your own, the aim is simple: **less dialog-hopping, more creating.**
 
-![Colour Grading interface](screenshots/colour-grading.png)
+<img width="2467" height="1421" alt="image" src="https://github.com/user-attachments/assets/0053481f-6c2f-4fb6-8a20-ad869e5069c3" />
+
 
 > **Made for photographers, artists and anyone who likes to push colour around until an image feels right.** The controls use approachable names; hover over them for the technical explanations.
 
