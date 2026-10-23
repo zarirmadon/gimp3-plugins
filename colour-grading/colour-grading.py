@@ -38,9 +38,11 @@ gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('GLib', '2.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
-from gi.repository import Gimp, GimpUi, Gegl, GLib, GObject, Gdk, Gtk, Pango
+from gi.repository import Gimp, GimpUi, Gegl, GLib, GObject, Gdk, GdkPixbuf, Gtk, Pango
 
 import cairo
+import threading
+import weakref
 
 PRESET_FORMATS = ('colour-grading-preset', 'color-grading-preset')
 GRADE_PARASITE = 'colour-grading-state-v1'
@@ -159,7 +161,7 @@ P = {
 
 PLUGIN_NAME  = 'colour-grading'
 MENU_LABEL   = 'Colour Grading'
-BUILD_TAG    = 'build 27'
+BUILD_TAG    = 'build 34'
 
 SHADOWS    = 'shadows'
 MIDTONES   = 'midtones'
@@ -345,8 +347,15 @@ class ScopeDisplay(Gtk.DrawingArea):
         return max(-.5, min(.5, cb)), max(-.5, min(.5, cr))
 
     def refresh(self, image, preview_layer=None):
-        t0 = time.monotonic()
         w, h, (r, g, b), label = grab_rgb_sample(image, preview_layer)
+        return self._refresh_planes(w, h, r, g, b, label)
+
+    def refresh_pixbuf(self, pixbuf):
+        w, h, (r, g, b) = _planes_from_pixbuf(pixbuf)
+        return self._refresh_planes(w, h, r, g, b, 'independent grading preview')
+
+    def _refresh_planes(self, w, h, r, g, b, label):
+        t0 = time.monotonic()
         cnt = [Counter(p) for p in (r, g, b)]
         self._hist = [[c.get(i, 0) for i in range(256)] for c in cnt]
         waves = [bytearray(w * 256) for _ in range(3)]
@@ -514,7 +523,7 @@ class PreviewManager:
                 raise RuntimeError('Could not create the Colour Grading preview layer.')
             layer.set_name(_next_result_name(self._image))
             self._image.insert_layer(layer, src.get_parent(), self._image.get_item_position(src))
-            layer.set_visible(True)
+            layer.set_visible(not getattr(self, '_separate_preview', False))
             self._preview_layer = layer
 
             transfer = {
@@ -815,6 +824,34 @@ PRESET_LOOKS = [
 PRESET_INDEX = {k: (label, tip, r) for k, label, tip, r in PRESET_LOOKS}
 
 
+def _hue_mask_from_lch(raw_lch, centre_deg, core_deg, outer_deg):
+    """A circular LCh hue matte with a soft chroma gate; output Y float bytes.
+
+    CIE LCh(ab) format stores (L* 0..100, C* native, h degrees 0..360),
+    unlike the normalised component greyscale extraction.  Using the native
+    coordinates makes the picker and the mask agree even on dark colours.
+    """
+    if _np is not None:
+        arr = _np.frombuffer(raw_lch, dtype=_np.float32).reshape(-1,3)
+        chroma = arr[:,1]
+        angles = _np.abs((_np.mod(arr[:,2] - centre_deg + 180.0, 360.0)) - 180.0)
+        width = max(1e-6, outer_deg-core_deg)
+        falloff = _np.clip((outer_deg - angles)/width, 0.0, 1.0)
+        chroma_weight = _np.clip((chroma - 3.0)/12.0, 0.0, 1.0)
+        return _np.asarray(falloff * chroma_weight, dtype=_np.float32).tobytes()
+    from array import array
+    inp = array('f'); inp.frombytes(raw_lch)
+    out = array('f', [0.0]) * (len(inp)//3)
+    inv_width = 1.0 / max(1e-6, outer_deg-core_deg)
+    for i in range(len(out)):
+        j = 3*i
+        dist = abs((inp[j+2] - centre_deg + 180.0) % 360.0 - 180.0)
+        falloff = max(0.0, min(1.0, (outer_deg-dist)*inv_width))
+        gate = max(0.0, min(1.0, (inp[j+1]-3.0)/12.0))
+        out[i] = falloff*gate
+    return out.tobytes()
+
+
 class ManagedPreviewManager(PreviewManager):
 
     def __init__(self, image, drawable):
@@ -952,6 +989,63 @@ class ManagedPreviewManager(PreviewManager):
         return self._trapezoid(root,self._component(root,src,ctx,'lab-l'),c,core,outer)
 
     def _hue_mask(self,root,src,ctx,p):
+        # Work in babl's *actual* CIE LCh coordinates, in degrees and native
+        # chroma units.  The previous GEGL graph assumed that two extracted
+        # greyscale components were normalised as H/360 and C/200.  Those
+        # implicit ranges are easy to mismatch with the eyedropper's real
+        # LCh hue and can quietly produce a near-empty mask for dark blues.
+        # Generate only a one-channel matte; the colour operation itself
+        # remains the original native gegl:hue-chroma stage.
+        base = getattr(self, '_hue_mask_buffer', None)
+        if base is None:
+            base = getattr(self, '_target_base_buffer', None)
+        if base is None:
+            # Defensive compatibility route, should not occur in either
+            # normal or independent-preview construction.
+            return self._hue_mask_legacy(root,src,ctx,p)
+        centre = float(p.get('source_hue', 0.0)) % 360.0
+        core, outer = self._widths(float(p.get('range',20.0))/360.0,
+                                   p.get('spread', .5), .24)
+        core *= 360.0
+        outer *= 360.0
+        extent = base.get_extent()
+        cache = getattr(self, '_hue_mask_cache', None)
+        key = (id(base), extent.x, extent.y, extent.width, extent.height,
+               round(centre, 5), round(core, 5), round(outer, 5))
+        mask_buffer = None
+        if cache is not None and key in cache:
+            original, cached = cache[key]
+            if original is base:
+                mask_buffer = cached
+        if mask_buffer is None:
+            try:
+                mask_buffer = Gegl.Buffer.new('Y float', extent.x, extent.y,
+                                              extent.width, extent.height)
+                for y in range(extent.y, extent.y + extent.height, 96):
+                    height = min(96, extent.y + extent.height - y)
+                    rect = Gegl.Rectangle.new(extent.x, y, extent.width, height)
+                    # babl converts through the source buffer's colour space.
+                    samples = bytes(base.get(rect, 1.0, 'CIE LCH(ab) float',
+                                             Gegl.AbyssPolicy.NONE))
+                    weights = _hue_mask_from_lch(samples, centre, core, outer)
+                    mask_buffer.set(rect, 'Y float', weights)
+                mask_buffer.flush()
+            except Exception as exc:
+                # Preserve the working renderer on exotic/unsupported babl
+                # configurations rather than aborting a full Apply.
+                _dbg('Native LCh mask unavailable; old mask path used: %r' % (exc,))
+                if hasattr(self, '_stage_warning'):
+                    self._stage_warning('LCh hue mask fallback — ' + str(exc))
+                return self._hue_mask_legacy(root, src, ctx, p)
+            if cache is not None:
+                if len(cache) >= 6:
+                    cache.pop(next(iter(cache)))
+                cache[key] = (base, mask_buffer)
+        node = self._gop(root, 'gegl:buffer-source')
+        node.set_property('buffer', mask_buffer)
+        return node
+
+    def _hue_mask_legacy(self,root,src,ctx,p):
         c=(float(p.get('source_hue',0.0))%360.0)/360.0
         core,outer=self._widths(float(p.get('range',20.0))/360.0,p.get('spread',.5),.24)
         H=self._component(root,src,ctx,'lch-h'); acc=None
@@ -1063,7 +1157,11 @@ class ManagedPreviewManager(PreviewManager):
         if ctx is not None: return ctx
         px=extent.width*extent.height
         if px<self.DRAFT_MIN_PIXELS: return None
-        f=0.75 if px<=2500000 else 0.4
+        # Keep interactive drafts within a bounded pixel budget.  The original
+        # full-resolution buffer remains untouched and is used for final renders.
+        # This avoids a multi-megapixel intermediate on large photographs.
+        budget = 1500000 if px > 2500000 else 1000000
+        f = min(0.75, math.sqrt(budget / float(px)))
         w2=max(1,int(math.ceil(extent.width*f))); h2=max(1,int(math.ceil(extent.height*f)))
         base=self._target_base_buffer
         dst=Gegl.Buffer.new("R'G'B'A float",0,0,w2,h2)
@@ -1118,7 +1216,7 @@ class ManagedPreviewManager(PreviewManager):
             try:
                 current=self._build_targeted_graph(root,src,specs) if specs else src
                 current=self._contrast_nodes(root,current)
-                if draft: current=self._chain(current,self._gop(root,'gegl:scale-ratio',x=ctx['sx'],y=ctx['sy'],sampler='nearest'))
+                if draft: current=self._chain(current,self._gop(root,'gegl:scale-ratio',x=ctx['sx'],y=ctx['sy'],sampler='linear'))
                 self._blit_node_to_buffer(current,target,extent)
             finally:
                 if persist:
@@ -1483,6 +1581,13 @@ class LutPreviewManager(ManagedPreviewManager):
         self._lut_strength = 1.0
 
     def _init_targeted_filters(self):
+        if getattr(self, '_separate_preview', False) and not getattr(self, '_force_target_init', False):
+            # No full-resolution duplicate or image processing before Apply.
+            self._target_base_buffer = None
+            self._orig_base = None
+            self._lut = None
+            self._lut_full = None
+            return
         super()._init_targeted_filters()
         self._orig_base = self._target_base_buffer
         self._lut = None
@@ -1538,6 +1643,732 @@ class LutPreviewManager(ManagedPreviewManager):
         self._last_target_sig = None; self._last_draft_sig = None; self._target_dirty = True
         self._render_targeted()
         self._display_flush()
+
+
+
+# The expensive GEGL graph is evaluated on a private buffer in a low-priority
+# worker. No GTK, GIMP drawable/layer or display methods run on that worker.
+# The main thread copies completed pixels in short slices, so interactions and
+# Cancel/Apply remain responsive even while an older render is still running.
+class _IsolatedTargetGraph:
+    TONE_L_SCALE = ManagedPreviewManager.TONE_L_SCALE
+    _gop = ManagedPreviewManager._gop
+    _chain = staticmethod(ManagedPreviewManager._chain)
+    _aux = staticmethod(ManagedPreviewManager._aux)
+    _ramp = ManagedPreviewManager._ramp
+    _mul = ManagedPreviewManager._mul
+    _add = ManagedPreviewManager._add
+    _trapezoid = ManagedPreviewManager._trapezoid
+    _widths = staticmethod(ManagedPreviewManager._widths)
+    _component = ManagedPreviewManager._component
+    _luma_mask = ManagedPreviewManager._luma_mask
+    _hue_mask = ManagedPreviewManager._hue_mask
+    _hue_mask_legacy = ManagedPreviewManager._hue_mask_legacy
+    _adjust_chain = ManagedPreviewManager._adjust_chain
+    _stage_specs = ManagedPreviewManager._stage_specs
+    _build_targeted_graph = ManagedPreviewManager._build_targeted_graph
+    _contrast_params = ManagedPreviewManager._contrast_params
+    _contrast_nodes = ManagedPreviewManager._contrast_nodes
+    _blit_node_to_buffer = staticmethod(ManagedPreviewManager._blit_node_to_buffer)
+
+    def __init__(self, job):
+        self._tone_state = job['tone']
+        self._tonal_colour_state = job['tonal']
+        self._hue_adjust_state = job['hue']
+        self._global_hue = job['global_hue']
+        self._contrast_value = job['contrast']
+        self._pivot_value = job['pivot']
+        self._ana_root = None
+        self._ana_src = None
+        self._ana_nodes = {}
+        self._mask_nodes = {}
+        self._mask_cache_ok = False
+        self._mask_used = set()
+        self._made = []
+
+
+class _AsyncTargetPreview:
+    # GEGL may use its own internal threads; only one plug-in render is queued
+    # or running here. Newly edited states supersede older ones immediately.
+    # GEGL buffers transfer in roughly 180k-pixel chunks, not 16-line slivers.
+    # Short timeouts yield to GTK without adding seconds of artificial delay.
+    COPY_PIXELS = 180000
+    COPY_SLICE_MS = 3
+    RENDER_ROWS = 128
+
+    def __init__(self, dialog):
+        self._owner = weakref.ref(dialog)
+        self._condition = threading.Condition()
+        self._generation = 0
+        self._job = None
+        self._busy = False
+        self._delivery_generation = None
+        self._closed = False
+        self._draft_original = None
+        self._draft_source = None
+        # No GIMP drawable access or large GEGL snapshot in the GTK startup path.
+        # A native-format private template is obtained by the worker on first job.
+        self._template = None
+        self._thread = threading.Thread(target=self._run, name='ColourGradingPreview', daemon=True)
+        self._thread.start()
+
+    def invalidate(self):
+        with self._condition:
+            self._generation += 1
+            self._job = None
+            self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._generation += 1
+            self._job = None
+            self._condition.notify_all()
+
+    def submit(self, job):
+        with self._condition:
+            if self._closed:
+                return
+            self._generation += 1
+            job['generation'] = self._generation
+            self._job = job
+            self._condition.notify_all()
+
+    def busy(self):
+        with self._condition:
+            return self._busy or self._job is not None or self._delivery_generation == self._generation
+
+    def _obsolete(self, generation):
+        with self._condition:
+            return self._closed or generation != self._generation
+
+    def _draft_base(self, base, extent, generation):
+        if self._draft_original is base and self._draft_source is not None:
+            return self._draft_source
+        pixels = extent.width * extent.height
+        if pixels < ManagedPreviewManager.DRAFT_MIN_PIXELS:
+            return base
+        budget = 1500000 if pixels > 2500000 else 1000000
+        scale = min(0.75, math.sqrt(budget / float(pixels)))
+        w = max(1, int(math.ceil(extent.width * scale)))
+        h = max(1, int(math.ceil(extent.height * scale)))
+        low = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+        root = Gegl.Node.new()
+        source = root.create_child('gegl:buffer-source')
+        source.set_property('buffer', base)
+        shrink = root.create_child('gegl:scale-ratio')
+        shrink.set_property('x', w / float(extent.width))
+        shrink.set_property('y', h / float(extent.height))
+        shrink.set_property('sampler', 'linear')
+        source.link(shrink)
+        _IsolatedTargetGraph._blit_node_to_buffer(shrink, low, Gegl.Rectangle.new(0, 0, w, h))
+        if self._obsolete(generation):
+            return None
+        self._draft_original = base
+        self._draft_source = low
+        return low
+
+    def _render(self, job):
+        generation = job['generation']
+        base = job['base']
+        if self._template is None:
+            # The snapshot is created on the worker, only when a preview is
+            # actually requested. The native babl pixel format is preserved.
+            self._template = base.dup()
+        full_extent = self._template.get_extent()
+        render_base = base
+        if job['draft']:
+            render_base = self._draft_base(base, full_extent, generation)
+            if render_base is None:
+                return None
+        if self._obsolete(generation):
+            return None
+        graph = _IsolatedTargetGraph(job)
+        graph._hue_mask_buffer = render_base
+        root = Gegl.Node.new()
+        source = root.create_child('gegl:buffer-source')
+        source.set_property('buffer', render_base)
+        specs = graph._stage_specs()
+        output = graph._build_targeted_graph(root, source, specs) if specs else source
+        output = graph._contrast_nodes(root, output)
+        if job['draft'] and render_base is not base:
+            ext2 = render_base.get_extent()
+            output = graph._chain(output, graph._gop(
+                root, 'gegl:scale-ratio', x=full_extent.width / float(ext2.width),
+                y=full_extent.height / float(ext2.height), sampler='linear'))
+        # Private scratch buffer: GIMP never sees incomplete worker pixels.
+        result = self._template.dup()
+        for row in range(0, full_extent.height, self.RENDER_ROWS):
+            if self._obsolete(generation):
+                return None
+            rect = Gegl.Rectangle.new(full_extent.x, full_extent.y + row,
+                                      full_extent.width,
+                                      min(self.RENDER_ROWS, full_extent.height - row))
+            graph._blit_node_to_buffer(output, result, rect)
+        if self._obsolete(generation):
+            return None
+        result.flush()
+        return result
+
+    def _run(self):
+        # Linux per-thread niceness: reserve CPU scheduling preference for GTK.
+        # Never call os.nice(), which could also demote the main UI thread.
+        try:
+            if (sys.platform.startswith('linux') and hasattr(os, 'setpriority')
+                    and hasattr(threading, 'get_native_id')):
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 8)
+        except (OSError, AttributeError):
+            pass
+        while True:
+            with self._condition:
+                while self._job is None and not self._closed:
+                    self._condition.wait()
+                if self._closed:
+                    return
+                job = self._job
+                self._job = None
+                self._busy = True
+            t0 = time.monotonic()
+            try:
+                result = self._render(job)
+                err = None
+            except Exception as exc:
+                result = None
+                err = str(exc)
+                _dbg('background GEGL preview failed: %r' % (exc,))
+            duration = (time.monotonic() - t0) * 1000.0
+            with self._condition:
+                self._busy = False
+                if self._closed:
+                    return
+                valid = job['generation'] == self._generation
+                if valid:
+                    self._delivery_generation = job['generation']
+            if valid:
+                GLib.idle_add(self._deliver, job['generation'], result,
+                              job['draft'], duration, err,
+                              priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+    def _deliver(self, generation, result, draft, duration, err):
+        with self._condition:
+            if self._delivery_generation == generation:
+                self._delivery_generation = None
+            valid = not self._closed and generation == self._generation
+        owner = self._owner() if valid else None
+        if owner is not None:
+            owner._receive_async_target(generation, result, draft, duration, err)
+        return False
+
+    def is_current(self, generation):
+        return not self._obsolete(generation)
+
+# Build 33: independent GTK viewport.  Never updates GIMP's canvas during
+# interaction; all creative controls are rendered from a read-only source
+# GEGL buffer into a private, minimum-1200px-short-edge preview.
+class _GradingPreviewViewport(Gtk.DrawingArea):
+    def __init__(self, request_cb):
+        super().__init__()
+        self._request_cb = request_cb
+        self.image_width = 1
+        self.image_height = 1
+        self.zoom = 1.0
+        self.fit_mode = True
+        self.center_x = 0.5
+        self.center_y = 0.5
+        self.before_pixbuf = None
+        self.after_pixbuf = None
+        self.fit_before = None
+        self.fit_after = None
+        self.roi = (0, 0, 1, 1)
+        self.before_held = False
+        self._drag_at = None
+        self._previous_size = (0, 0)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_size_request(300, 360)
+        self.set_can_focus(True)
+        self.set_tooltip_text('Mouse wheel: zoom at pointer. Drag: pan. Shift+wheel: pan horizontally. '
+                              'Ctrl+wheel: pan vertically. Hold B: show Before. Fit resets the view.')
+        self.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+                        Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.BUTTON1_MOTION_MASK |
+                        Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect('draw', self._draw)
+        self.connect('size-allocate', self._resized)
+        self.connect('scroll-event', self._scroll)
+        self.connect('button-press-event', self._press)
+        self.connect('motion-notify-event', self._motion)
+        self.connect('button-release-event', self._release)
+
+    def set_image_size(self, width, height):
+        self.image_width = max(1, int(width))
+        self.image_height = max(1, int(height))
+        self.center_x, self.center_y = self.image_width / 2., self.image_height / 2.
+        self.fit_view(request=False)
+
+    def _fit_scale(self):
+        w = max(1, self.get_allocated_width() - 24)
+        h = max(1, self.get_allocated_height() - 24)
+        return max(0.001, min(w / float(self.image_width), h / float(self.image_height)))
+
+    def fit_view(self, request=True):
+        self.fit_mode = True
+        self.zoom = self._fit_scale()
+        self.center_x, self.center_y = self.image_width / 2., self.image_height / 2.
+        self.queue_draw()
+        if request: self._request_cb()
+
+    def actual_pixels(self):
+        self.fit_mode = False
+        self.zoom = 1.0
+        self._clamp_center()
+        self.queue_draw()
+        self._request_cb()
+
+    def _clamp_center(self):
+        w = self.get_allocated_width() / max(0.001, self.zoom)
+        h = self.get_allocated_height() / max(0.001, self.zoom)
+        if w < self.image_width:
+            self.center_x = max(w / 2., min(self.image_width - w / 2., self.center_x))
+        else: self.center_x = self.image_width / 2.
+        if h < self.image_height:
+            self.center_y = max(h / 2., min(self.image_height - h / 2., self.center_y))
+        else: self.center_y = self.image_height / 2.
+
+    def _resized(self, _widget, alloc):
+        size = (alloc.width, alloc.height)
+        if size == self._previous_size: return
+        self._previous_size = size
+        if self.fit_mode:
+            self.zoom = self._fit_scale()
+        else: self._clamp_center()
+        self.queue_draw()
+        if self.after_pixbuf is not None: self._request_cb()
+
+    def zoom_by(self, factor, x=None, y=None):
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        if x is None: x = w / 2.
+        if y is None: y = h / 2.
+        ix = self.center_x + (x - w / 2.) / self.zoom
+        iy = self.center_y + (y - h / 2.) / self.zoom
+        self.zoom = max(self._fit_scale() * 0.5, min(8.0, self.zoom * factor))
+        self.fit_mode = False
+        self.center_x = ix - (x - w / 2.) / self.zoom
+        self.center_y = iy - (y - h / 2.) / self.zoom
+        self._clamp_center()
+        self.queue_draw()
+        self._request_cb()
+
+    def _scroll(self, _widget, event):
+        direction = event.direction
+        if direction == Gdk.ScrollDirection.SMOOTH:
+            dy = float(getattr(event, 'delta_y', 0.))
+            if abs(dy) < 0.01:
+                try:
+                    ok, _dx, dy = event.get_scroll_deltas()
+                    if not ok: return True
+                except Exception: return True
+            if abs(dy) < 0.01: return True
+            turns = -dy
+        else:
+            turns = 1.0 if direction == Gdk.ScrollDirection.UP else (-1.0 if direction == Gdk.ScrollDirection.DOWN else 0.)
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            self.center_x -= turns * self.get_allocated_width() / max(self.zoom, 0.001) * 0.12
+            self.fit_mode = False
+            self._clamp_center()
+            self.queue_draw()
+            self._request_cb()
+        elif event.state & Gdk.ModifierType.CONTROL_MASK:
+            self.center_y -= turns * self.get_allocated_height() / max(self.zoom, 0.001) * 0.12
+            self.fit_mode = False
+            self._clamp_center()
+            self.queue_draw()
+            self._request_cb()
+        else:
+            self.zoom_by(1.18 ** turns, event.x, event.y)
+        return True
+
+    def _press(self, _widget, event):
+        if event.button != 1: return False
+        self.grab_focus()
+        self._drag_at = (event.x, event.y, self.center_x, self.center_y)
+        return True
+
+    def _motion(self, _widget, event):
+        if self._drag_at is None: return False
+        x, y, cx, cy = self._drag_at
+        self.center_x = cx - (event.x - x) / max(self.zoom, 0.001)
+        self.center_y = cy - (event.y - y) / max(self.zoom, 0.001)
+        self.fit_mode = False
+        self._clamp_center()
+        self.queue_draw()
+        # Pan immediately; request a new native crop if we're approaching the
+        # edge of the current one. The full-image base stays visible beneath.
+        if self.roi != (0, 0, self.image_width, self.image_height):
+            rx, ry, rw, rh = self.roi
+            half_w = self.get_allocated_width() / max(self.zoom, .001) / 2.
+            half_h = self.get_allocated_height() / max(self.zoom, .001) / 2.
+            if (self.center_x - half_w < rx + 8 or self.center_x + half_w > rx + rw - 8 or
+                    self.center_y - half_h < ry + 8 or self.center_y + half_h > ry + rh - 8):
+                self._request_cb()
+        return True
+
+    def _release(self, _widget, event):
+        if event.button == 1 and self._drag_at is not None:
+            self._drag_at = None
+            self._request_cb()
+            return True
+        return False
+
+    def render_plan(self):
+        full_w, full_h = self.image_width, self.image_height
+        fit_scale = min(1.0, 1200.0 / float(min(full_w, full_h)))
+        # Use the whole cached >=1200px preview whenever it has enough native
+        # detail to cover the current screen scale.
+        if self.zoom <= fit_scale * 1.05:
+            return (0, 0, full_w, full_h), (max(1, int(round(full_w * fit_scale))),
+                                               max(1, int(round(full_h * fit_scale))))
+        w = min(full_w, max(1, int(math.ceil(self.get_allocated_width() / self.zoom * 1.45)) + 8))
+        h = min(full_h, max(1, int(math.ceil(self.get_allocated_height() / self.zoom * 1.45)) + 8))
+        x = max(0, min(full_w - w, int(math.floor(self.center_x - w / 2.))))
+        y = max(0, min(full_h - h, int(math.floor(self.center_y - h / 2.))))
+        # At magnified zoom the visible crop is rendered at native resolution;
+        # don't upscale a thumbnail at 100%.
+        return (x, y, w, h), (w, h)
+
+    def set_pixels(self, roi, size, before, after):
+        w, h = size
+        def make(data):
+            blob = GLib.Bytes.new(data)
+            return GdkPixbuf.Pixbuf.new_from_bytes(blob, GdkPixbuf.Colorspace.RGB,
+                                                   True, 8, w, h, w * 4)
+        self.before_pixbuf = make(before)
+        self.after_pixbuf = make(after)
+        self.roi = tuple(roi)
+        if self.roi == (0, 0, self.image_width, self.image_height):
+            self.fit_before = self.before_pixbuf
+            self.fit_after = self.after_pixbuf
+        self.queue_draw()
+
+    def hold_before(self, value):
+        if self.before_held != bool(value):
+            self.before_held = bool(value)
+            self.queue_draw()
+
+    def _draw(self, _widget, cr):
+        W = self.get_allocated_width()
+        H = self.get_allocated_height()
+        cr.set_source_rgb(0.12, 0.12, 0.12)
+        cr.paint()
+        pix = self.before_pixbuf if self.before_held else self.after_pixbuf
+        if pix is None:
+            cr.set_source_rgba(1, 1, 1, .6)
+            cr.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(14)
+            cr.move_to(max(12, W / 2 - 80), H / 2)
+            cr.show_text('Preparing preview…')
+            return False
+        ox = W / 2. - self.center_x * self.zoom
+        oy = H / 2. - self.center_y * self.zoom
+
+        def draw_patch(pb, rect):
+            if pb is None: return
+            rx, ry, rw, rh = rect
+            sx = (rw / float(max(1, pb.get_width()))) * self.zoom
+            sy = (rh / float(max(1, pb.get_height()))) * self.zoom
+            cr.save()
+            cr.translate(ox + rx * self.zoom, oy + ry * self.zoom)
+            cr.scale(sx, sy)
+            Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+            cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+            cr.rectangle(0, 0, pb.get_width(), pb.get_height())
+            cr.fill()
+            cr.restore()
+
+        full = (0, 0, self.image_width, self.image_height)
+        if self.roi != full:
+            draw_patch(self.fit_before if self.before_held else self.fit_after, full)
+        draw_patch(pix, self.roi)
+        return False
+
+
+class _IndependentPreviewWorker:
+    # GEGL-only worker; no GTK or GIMP drawable API calls outside main thread.
+    # Only newest state is delivered; the previous frame stays intact until then.
+    RENDER_ROWS = 160
+
+    def __init__(self, dialog, base):
+        self._owner = weakref.ref(dialog)
+        self._base = base
+        self._condition = threading.Condition()
+        self._generation = 0
+        self._closed = False
+        self._job = None
+        self._running = False
+        self._fit_cache = {}
+        self._hue_mask_cache = {}
+        self._thread = threading.Thread(target=self._run, name='ColourGradingViewport', daemon=True)
+        self._thread.start()
+
+    def submit(self, job):
+        with self._condition:
+            if self._closed: return
+            self._generation += 1
+            job['generation'] = self._generation
+            self._job = job
+            self._condition.notify()
+
+    def invalidate(self):
+        with self._condition:
+            self._generation += 1
+            self._job = None
+            self._condition.notify()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._generation += 1
+            self._job = None
+            self._fit_cache.clear()
+            self._hue_mask_cache.clear()
+            self._condition.notify()
+
+    def _obsolete(self, gen):
+        with self._condition:
+            return self._closed or gen != self._generation
+
+    def _base_for(self, roi, size, gen):
+        rx, ry, rw, rh = roi
+        w, h = size
+        if (rx, ry, rw, rh) == (0, 0, self._base.get_extent().width, self._base.get_extent().height) and (w, h) != (rw, rh):
+            key = (w, h)
+            if key in self._fit_cache: return self._fit_cache[key]
+            root = Gegl.Node.new()
+            inp = root.create_child('gegl:buffer-source')
+            inp.set_property('buffer', self._base)
+            scale = root.create_child('gegl:scale-ratio')
+            scale.set_property('x', w / float(rw))
+            scale.set_property('y', h / float(rh))
+            scale.set_property('sampler', 'linear')
+            inp.link(scale)
+            output = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+            _IsolatedTargetGraph._blit_node_to_buffer(scale, output, Gegl.Rectangle.new(0, 0, w, h))
+            # The resampled original is independent of the grade. Keep it even
+            # if slider movement invalidated the render while scaling.
+            if not self._closed: self._fit_cache[key] = output
+            return output
+        rect = Gegl.Rectangle.new(rx, ry, rw, rh)
+        raw = self._base.get(rect, 1.0, "R'G'B'A float", Gegl.AbyssPolicy.NONE)
+        out = Gegl.Buffer.new("R'G'B'A float", 0, 0, rw, rh)
+        out.set(Gegl.Rectangle.new(0, 0, rw, rh), "R'G'B'A float", bytes(raw))
+        return out
+
+    @staticmethod
+    def _balance_params(st, band):
+        rgb = st['bands'].get(band, [0, 0, 0])
+        master = st['master']
+        ranges = st['ranges']
+        scale = CB_SCALE[band]
+        if band == SHADOWS:
+            scale *= math.exp((DEFAULT_SHADOWS_MID - max(0., min(1., float(ranges['shadows_mid'])))) * 2.)
+        elif band == HIGHLIGHTS:
+            scale *= math.exp((max(0., min(1., float(ranges['highlights_mid']))) - DEFAULT_HIGHLIGHTS_MID) * 2.)
+        else:
+            width = max(.02, float(ranges['midtones_right']) - float(ranges['midtones_left']))
+            scale *= max(.25, min(3., (width / (DEFAULT_MIDTONES_RIGHT - DEFAULT_MIDTONES_LEFT)) ** 1.35))
+        return tuple(max(-1., min(1., (float(rgb[k]) * scale + float(master[k])) * .72)) for k in range(3))
+
+    @staticmethod
+    def _balance_array(data, band, gains):
+        # Mirrors gimpoperationcolorbalance.c: HSL lightness mask, per-channel
+        # corrections, clamp, and HSL preserve-luminosity. Alpha is unchanged.
+        np = _np
+        if np is not None:
+            a = np.frombuffer(data, dtype=np.float32).reshape(-1, 4).copy()
+            rgb = a[:, :3]
+            before = (rgb.max(axis=1) + rgb.min(axis=1)) * np.float32(.5)
+            if band == SHADOWS:
+                mask = np.clip((before - np.float32(.333)) / np.float32(-.25) + .5, 0., 1.) * .7
+            elif band == MIDTONES:
+                mask = np.clip((before - .333) / .25 + .5, 0., 1.) * np.clip((before + .333 - 1.) / -.25 + .5, 0., 1.) * .7
+            else:
+                mask = np.clip((before + .333 - 1.) / .25 + .5, 0., 1.) * .7
+            rgb[:] = np.clip(rgb + mask[:, None] * np.asarray(gains, dtype=np.float32), 0., 1.)
+            after = (rgb.max(axis=1) + rgb.min(axis=1)) * np.float32(.5)
+            denom = 1. - np.abs(2. * after - 1.)
+            numer = 1. - np.abs(2. * before - 1.)
+            ratio = np.divide(numer, denom, out=np.zeros_like(numer), where=denom > 1e-8)
+            rgb[:] = np.clip(before[:, None] + (rgb - after[:, None]) * ratio[:, None], 0., 1.)
+            return a.tobytes()
+        from array import array
+        a = array('f')
+        a.frombytes(data)
+        for i in range(0, len(a), 4):
+            r, g, b = a[i], a[i+1], a[i+2]
+            original = (max(r, g, b) + min(r, g, b)) * .5
+            if band == SHADOWS: mask = max(0., min(1., (original - .333)/-.25 + .5)) * .7
+            elif band == MIDTONES:
+                mask = max(0., min(1., (original-.333)/.25+.5)) * max(0., min(1., (original+.333-1.)/-.25+.5)) * .7
+            else: mask = max(0., min(1., (original+.333-1.)/.25+.5)) * .7
+            values = [max(0., min(1., c + mask * gain)) for c, gain in zip((r,g,b), gains)]
+            light = (max(values) + min(values)) * .5
+            den = 1. - abs(2.*light - 1.)
+            ratio = (1. - abs(2.*original - 1.)) / den if den > 1e-8 else 0.
+            for k in range(3): a[i+k] = max(0., min(1., original + (values[k]-light)*ratio))
+        return a.tobytes()
+
+    def _apply_balances(self, image, st, gen):
+        extent = image.get_extent()
+        w, h = extent.width, extent.height
+        active = [(b, self._balance_params(st, b)) for b in BANDS]
+        active = [(b, vals) for b, vals in active if any(abs(v) > 1e-7 for v in vals)]
+        if not active: return image
+        out = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+        # Keep working-set small, even without NumPy.
+        for y in range(0, h, 64):
+            if self._obsolete(gen): return None
+            rh = min(64, h - y)
+            rect = Gegl.Rectangle.new(0, y, w, rh)
+            raw = bytes(image.get(rect, 1., "R'G'B'A float", Gegl.AbyssPolicy.NONE))
+            for band, gains in active:
+                raw = self._balance_array(raw, band, gains)
+            out.set(rect, "R'G'B'A float", raw)
+        return out
+
+    @staticmethod
+    def _node(root, prev, op, **values):
+        node = root.create_child(op)
+        for prop, value in values.items():
+            node.set_property(prop.replace('_', '-'), value)
+        prev.link(node)
+        return node
+
+    def _native_nodes(self, root, node, st):
+        sat = max(0., min(2., float(st['saturation'])))
+        if abs(sat-1.) > 1e-7:
+            node = self._node(root, node, 'gegl:saturation', scale=sat)
+            try: node.set_property('colorspace', 'CIE-Lab')
+            except Exception:
+                try: node.set_property('colorspace', 1)
+                except Exception: pass
+        prim = st['primaries']
+        if any(abs(float(prim[k][prop])) > 1e-7 for k in ('red','green','blue') for prop in ('hue','purity')):
+            m = ManagedPreviewManager._primary_matrix(prim)
+            node = self._node(root, node, 'gegl:channel-mixer', preserve_luminosity=True,
+                              rr_gain=m[0][0], rg_gain=m[0][1], rb_gain=m[0][2],
+                              gr_gain=m[1][0], gg_gain=m[1][1], gb_gain=m[1][2],
+                              br_gain=m[2][0], bg_gain=m[2][1], bb_gain=m[2][2])
+        gc = st['global_colour']
+        temp = max(-100., min(100., float(gc.get('temperature', 0.))))
+        if abs(temp) > 1e-7:
+            a,b = ManagedPreviewManager._kelvin_pair(temp)
+            node = self._node(root, node, 'gegl:color-temperature', original_temperature=a, intended_temperature=b)
+        tint = max(-100., min(100., float(gc.get('tint', 0.))))/100.
+        if abs(tint) > 1e-7:
+            k = math.copysign(.40*abs(tint) + .60*abs(tint)**2, tint) * .70
+            node = self._node(root, node, 'gegl:channel-mixer', preserve_luminosity=False,
+                              rr_gain=1.+k, rg_gain=0., rb_gain=0., gr_gain=0., gg_gain=1.-k,
+                              gb_gain=0., br_gain=0., bg_gain=0., bb_gain=1.+k)
+        chroma = max(-100., min(100., float(gc.get('chroma',0.)))) * .60
+        if abs(chroma) > 1e-7:
+            node = self._node(root, node, 'gegl:hue-chroma', chroma=chroma)
+        sat_global = max(0., min(200., float(gc.get('saturation', 100.))))
+        sat_global = sat_global / 100. if sat_global <= 100. else 1. + (sat_global-100.)/100.*.70
+        if abs(sat_global-1.) > 1e-7:
+            node = self._node(root, node, 'gegl:saturation', scale=sat_global)
+            try: node.set_property('colorspace', 'CIE-Lab')
+            except Exception:
+                try: node.set_property('colorspace',1)
+                except Exception: pass
+        return node
+
+    def _render(self, job):
+        gen = job['generation']
+        roi, size = job['roi'], job['size']
+        w, h = size
+        base = self._base_for(roi, size, gen)
+        if self._obsolete(gen): return None
+        area = Gegl.Rectangle.new(0, 0, w, h)
+        before = bytes(base.get(area, 1., "R'G'B'A u8", Gegl.AbyssPolicy.NONE))
+        st = job['grade']
+        lut = job.get('lut')
+        strength = float(job.get('lut_strength', 1.))
+        if lut is not None and strength > 0.001:
+            raw = bytes(base.get(area, 1., "R'G'B'A float", Gegl.AbyssPolicy.NONE))
+            transformed = apply_lut_raw(raw, lut)
+            if strength < 0.999: transformed = blend_raw(raw, transformed, strength)
+            base = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+            base.set(area, "R'G'B'A float", transformed)
+        if self._obsolete(gen): return None
+        targeted = _IsolatedTargetGraph({'tone':st['tone'], 'tonal':st['tonal_colour'],
+                                         'hue':st['hue_adjustments'], 'global_hue':st['global_hue'],
+                                         'contrast':st['contrast'], 'pivot':st['pivot']})
+        targeted._hue_mask_buffer = base
+        targeted._hue_mask_cache = self._hue_mask_cache
+        specs = targeted._stage_specs()
+        con = targeted._contrast_params()
+        if specs or con is not None:
+            root = Gegl.Node.new()
+            source = root.create_child('gegl:buffer-source')
+            source.set_property('buffer', base)
+            current = targeted._build_targeted_graph(root, source, specs) if specs else source
+            current = targeted._contrast_nodes(root, current)
+            new_base = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+            for y in range(0, h, self.RENDER_ROWS):
+                if self._obsolete(gen): return None
+                rect = Gegl.Rectangle.new(0, y, w, min(self.RENDER_ROWS, h-y))
+                targeted._blit_node_to_buffer(current, new_base, rect)
+            base = new_base
+        if self._obsolete(gen): return None
+        base = self._apply_balances(base, st, gen)
+        if base is None or self._obsolete(gen): return None
+        root = Gegl.Node.new()
+        source = root.create_child('gegl:buffer-source')
+        source.set_property('buffer', base)
+        node = self._native_nodes(root, source, st)
+        if node is source:
+            after = bytes(base.get(area, 1., "R'G'B'A u8", Gegl.AbyssPolicy.NONE))
+        else:
+            dst = Gegl.Buffer.new("R'G'B'A float", 0, 0, w, h)
+            for y in range(0, h, self.RENDER_ROWS):
+                if self._obsolete(gen): return None
+                rect = Gegl.Rectangle.new(0, y, w, min(self.RENDER_ROWS, h-y))
+                _IsolatedTargetGraph._blit_node_to_buffer(node, dst, rect)
+            after = bytes(dst.get(area, 1., "R'G'B'A u8", Gegl.AbyssPolicy.NONE))
+        return roi, size, before, after
+
+    def _run(self):
+        try:
+            if (sys.platform.startswith('linux') and hasattr(os, 'setpriority')
+                    and hasattr(threading, 'get_native_id')):
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+        except (OSError, AttributeError): pass
+        while True:
+            with self._condition:
+                while self._job is None and not self._closed:
+                    self._condition.wait()
+                if self._closed: return
+                job = self._job
+                self._job = None
+                self._running = True
+            try:
+                payload = self._render(job)
+                error = None
+            except Exception as exc:
+                payload, error = None, str(exc)
+                _dbg('Independent preview failed: %r' % exc)
+            with self._condition:
+                self._running = False
+                valid = not self._closed and job['generation'] == self._generation
+            if valid:
+                GLib.idle_add(self._deliver, job['generation'], payload, error,
+                              priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+    def _deliver(self, gen, payload, error):
+        if self._obsolete(gen): return False
+        dialog = self._owner()
+        if dialog is not None and not dialog._preview_closed:
+            dialog._independent_preview_result(payload, error)
+        return False
 
 
 _ACCENT = (0.29, 0.64, 1.0)
@@ -2758,6 +3589,11 @@ class ColourGradingDialog(Gtk.Dialog):
         self._source_drawable = drawable
         self._ready = False
         self._preview = LutPreviewManager(image, drawable)
+        self._preview._separate_preview = True
+        self._independent_worker = None
+        self._independent_timer = None
+        self._independent_signature = None
+        self._preview_canvas = None
 
         self._wheel_timer = {b: None for b in BANDS}
         self._range_timers = {b: None for b in BANDS}
@@ -2765,7 +3601,23 @@ class ColourGradingDialog(Gtk.Dialog):
         self._sat_timer = None
         self._contrast_timer = None
         self._managed_preview_timer = None
+        self._async_preview = None
+        self._async_unavailable = False
+        self._async_copy = None
+        self._async_copy_sid = None
+        self._final_timer = None
         self._last_render_ms = 0.0
+        # One global preview scheduler for every grading control/tab.
+        # Do not send GIMP/GEGL work from a slider's changed/released event.
+        self._last_ui_edit = 0.0
+        self._native_wheel_dirty = set()
+        self._native_master_dirty = False
+        self._native_ranges_dirty = set()
+        self._native_sat_dirty = False
+        self._native_contrast_dirty = False
+        self._preview_closed = False
+        self._preview_pixels = max(1, int(drawable.get_width()) * int(drawable.get_height()))
+        self._async_ready = None
         self._wheel_values = {b: (0.0, 0.0, 0.0, 0.0, 0.0) for b in BANDS}
         self._canonical_rgb = {b: (0.0, 0.0, 0.0) for b in BANDS}
         self._master_canonical_rgb = (0.0, 0.0, 0.0)
@@ -2787,6 +3639,7 @@ class ColourGradingDialog(Gtk.Dialog):
         self._pending_primaries = False
         self._pending_global = False
         self._scopes_dirty = True
+        self._scope_waiting = False
         self._loading_state = False
         self._closing_from_window = False
         self._initial_resize_done = False
@@ -2800,14 +3653,28 @@ class ColourGradingDialog(Gtk.Dialog):
         self.get_style_context().add_class('cg-dialog')
         self._build_ui()
         self._ready = True
+        self.connect('destroy', self._on_dialog_destroy)
         self.connect('delete-event', self._on_window_delete)
         self.connect('map-event', self._force_initial_window_size)
+        self.connect('key-press-event', self._before_key_press)
+        self.connect('key-release-event', self._before_key_release)
         GLib.idle_add(self._do_init)
 
     def _do_init(self):
         GimpUi.window_set_transient(self)
         Gimp.progress_init('Initialising Colour Grading…')
         self._preview.initialise()
+        if self._preview._initialised:
+            try:
+                src = self._source_drawable.get_buffer()
+                self._independent_worker = _IndependentPreviewWorker(self, src)
+                self._schedule_independent_viewport()
+            except Exception as exc:
+                _dbg('Independent preview startup: %r' % (exc,))
+                self._set_preview_activity(True, 'Preview unavailable: ' + str(exc)[:90])
+        # The background renderer starts only on the first targeted adjustment.
+        # Keeping dialog startup identical to the working renderer avoids an
+        # extra GEGL snapshot or thread at open time.
         try: Gimp.progress_end()
         except Exception: pass
         self._refresh_colour_diagnostics()
@@ -2821,10 +3688,9 @@ class ColourGradingDialog(Gtk.Dialog):
                 if monitor is None and display.get_n_monitors() > 0: monitor = display.get_monitor(0)
             if monitor is not None:
                 wa = monitor.get_workarea()
-                return min(560, int(wa.width * 0.9)), max(480, min(940, int(wa.height * 0.84)))
-        except Exception:
-            pass
-        return 540, 780
+                return int(wa.width * 0.90), int(wa.height * 0.85)
+        except Exception: pass
+        return 1280, 760
 
     def _force_initial_window_size(self, widget, event):
         if not self._initial_resize_done:
@@ -2840,9 +3706,10 @@ class ColourGradingDialog(Gtk.Dialog):
                 mon = display.get_monitor_at_window(self.get_window())
             w, h = self._target_size(mon)
             self.resize(w, h)
+            self._split.set_position(max(300, w - 560))
             if mon is not None:
                 wa = mon.get_workarea()
-                self.move(wa.x + max(0, wa.width - w - 24), wa.y + max(0, (wa.height - h) // 2))
+                self.move(wa.x + max(0, (wa.width - w) // 2), wa.y + max(0, (wa.height - h) // 2))
         except Exception:
             pass
         return False
@@ -2851,9 +3718,42 @@ class ColourGradingDialog(Gtk.Dialog):
         self.set_border_width(0)
         self.set_resizable(True)
         self.set_default_size(*self._target_size())
-        self.set_size_request(470, 420)
+        self.set_size_request(820, 480)
         outer = self.get_content_area()
         outer.set_spacing(0)
+        self._split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self._split.set_wide_handle(True)
+        outer.pack_start(self._split, True, True, 0)
+
+        left = _vbox(6)
+        left.set_border_width(10)
+        left.set_hexpand(True)
+        left.set_vexpand(True)
+        bar = _hbox(8)
+        title = Gtk.Label(label='PREVIEW')
+        title.get_style_context().add_class('cg-sec')
+        bar.pack_start(title, False, False, 3)
+        bar.pack_start(Gtk.Label(label='Scroll: zoom  ·  Drag: pan  ·  Hold B: before'), True, True, 3)
+        fit = Gtk.Button(label='Fit')
+        fit.set_tooltip_text('Fit the entire photograph into the left preview')
+        fit.connect('clicked', lambda *_: self._preview_canvas.fit_view())
+        actual = Gtk.Button(label='100%')
+        actual.set_tooltip_text('Show actual image pixels. Drag to inspect other areas.')
+        actual.connect('clicked', lambda *_: self._preview_canvas.actual_pixels())
+        self._zoom_display = Gtk.Label(label='Fit')
+        self._zoom_display.set_width_chars(6)
+        self._zoom_display.set_tooltip_text('Current display zoom relative to the original image')
+        bar.pack_end(self._zoom_display, False, False, 0)
+        bar.pack_end(actual, False, False, 0)
+        bar.pack_end(fit, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+        self._preview_canvas = _GradingPreviewViewport(self._schedule_independent_viewport)
+        self._preview_canvas.set_image_size(self._source_drawable.get_width(), self._source_drawable.get_height())
+        left.pack_start(self._preview_canvas, True, True, 0)
+        self._split.pack1(left, resize=True, shrink=False)
+
+        right = _vbox(0)
+        right.set_size_request(560, -1)
         nb = Gtk.Notebook()
         nb.set_scrollable(True)
         nb.set_hexpand(True)
@@ -2865,8 +3765,9 @@ class ColourGradingDialog(Gtk.Dialog):
                               ('Looks', self._build_looks)):
             nb.append_page(self._scrolled(builder()), Gtk.Label(label=name))
         nb.connect('switch-page', self._on_notebook_switch_page)
-        outer.pack_start(nb, True, True, 0)
-        outer.pack_start(self._build_footer(), False, False, 0)
+        right.pack_start(nb, True, True, 0)
+        right.pack_start(self._build_footer(), False, False, 0)
+        self._split.pack2(right, resize=False, shrink=False)
         self.show_all()
         self._sync_balance_panel()
         self._sync_tone_ui()
@@ -2905,7 +3806,7 @@ class ColourGradingDialog(Gtk.Dialog):
         r1 = _hbox(10)
         self._global_preview = Gtk.CheckButton(label='Preview')
         self._global_preview.set_active(True)
-        self._global_preview.set_tooltip_text('Show or hide the grade on the picture')
+        self._global_preview.set_tooltip_text('Show or hide grading in the independent left preview (hold B to compare temporarily)')
         self._global_preview.connect('toggled', self._on_preview_toggled)
         r1.pack_start(self._global_preview, False, False, 0)
         lbl = Gtk.Label(label='Result goes to a new layer: ')
@@ -2915,6 +3816,12 @@ class ColourGradingDialog(Gtk.Dialog):
         except Exception: name.set_markup('<b>%s</b>' % RESULT_LAYER_NAME)
         r1.pack_start(lbl, False, False, 0)
         r1.pack_start(name, False, False, 0)
+        preview_state = _hbox(4)
+        self._preview_spinner = Gtk.Spinner()
+        self._preview_state_label = Gtk.Label(label='')
+        preview_state.set_tooltip_text('The picture preview runs behind the controls. You can keep adjusting while it updates; obsolete renders are discarded.')
+        preview_state.pack_start(self._preview_spinner, False, False, 0)
+        preview_state.pack_start(self._preview_state_label, False, False, 0)
         r2 = _hbox(6)
         restore = Gtk.Button(label='Restore last edit')
         restore.set_tooltip_text('Load the grade you last applied to this layer')
@@ -2930,6 +3837,7 @@ class ColourGradingDialog(Gtk.Dialog):
         apply_.connect('clicked', self._on_ok)
         r2.pack_start(restore, False, False, 0)
         r2.pack_start(reset, False, False, 0)
+        r2.pack_start(preview_state, False, False, 0)
         r2.pack_end(apply_, False, False, 0)
         r2.pack_end(cancel, False, False, 0)
         box.pack_start(r1, False, False, 0)
@@ -3057,6 +3965,7 @@ class ColourGradingDialog(Gtk.Dialog):
 
 
     def _set_active_band(self, band):
+        self._pause_preview_for_input()
         self._active = band
         for b in BANDS:
             self._discs[b].set_active(b == band)
@@ -3100,10 +4009,12 @@ class ColourGradingDialog(Gtk.Dialog):
         self._scopes_dirty = True
         if band == MASTER:
             self._master_canonical_rgb = tuple(float(x) for x in rgb)
-            if self._master_timer is None:
-                self._master_timer = GLib.timeout_add(PREVIEW_FAST_MS, self._flush_master_rgb)
+            self._native_master_dirty = True
         else:
-            self._push_band_colour(band, *rgb)
+            self._canonical_rgb[band] = tuple(float(x) for x in rgb)
+            self._wheel_values[band] = (0.0, 0.0, *self._canonical_rgb[band])
+            self._native_wheel_dirty.add(band)
+        self._schedule_managed_preview()
 
     def _after_wheel(self, band):
         h, s = self._hs[band]
@@ -3145,12 +4056,14 @@ class ColourGradingDialog(Gtk.Dialog):
         self._schedule_range(b)
 
     def _schedule_range(self, band):
-        if self._range_timers[band] is None:
-            self._range_timers[band] = GLib.timeout_add(PREVIEW_FAST_MS, self._flush_range, band)
+        self._native_ranges_dirty.add(band)
+        self._schedule_managed_preview()
 
     def _flush_range(self, band):
+        # Legacy callback: all native filters now share the global scheduler.
         self._range_timers[band] = None
-        self._preview.update_ranges(dict(self._ranges), band=band)
+        self._native_ranges_dirty.add(band)
+        self._schedule_managed_preview()
         return False
 
     def _set_saturation_percent(self, pct):
@@ -3165,12 +4078,13 @@ class ColourGradingDialog(Gtk.Dialog):
     def _on_saturation_changed(self, value):
         self._sat_value = float(value)
         self._scopes_dirty = True
-        if self._sat_timer is None:
-            self._sat_timer = GLib.timeout_add(PREVIEW_FAST_MS, self._flush_saturation_pending)
+        self._native_sat_dirty = True
+        self._schedule_managed_preview()
 
     def _flush_saturation_pending(self):
         self._sat_timer = None
-        self._preview.update_saturation(self._sat_value)
+        self._native_sat_dirty = True
+        self._schedule_managed_preview()
         return False
 
     def _on_con_slider(self, _s, v):
@@ -3183,12 +4097,12 @@ class ColourGradingDialog(Gtk.Dialog):
 
     def _queue_contrast(self):
         self._scopes_dirty = True
-        if self._contrast_timer is None:
-            self._contrast_timer = GLib.timeout_add(PREVIEW_FAST_MS, self._flush_contrast_pending)
+        self._native_contrast_dirty = True
+        self._schedule_targeted()
 
     def _flush_contrast_pending(self):
         self._contrast_timer = None
-        self._preview.set_contrast(self._contrast, self._pivot)
+        self._native_contrast_dirty = True
         self._schedule_targeted()
         return False
 
@@ -3245,6 +4159,7 @@ class ColourGradingDialog(Gtk.Dialog):
         self._tone_strip.queue_draw()
 
     def _select_tone(self, i):
+        self._pause_preview_for_input()
         if not self._tone_state: return
         self._tone_sel = max(0, min(len(self._tone_state) - 1, int(i)))
         self._sync_tone_ui()
@@ -3324,6 +4239,7 @@ class ColourGradingDialog(Gtk.Dialog):
         return root
 
     def _tc_set_active(self, i):
+        self._pause_preview_for_input()
         if self._tc_active != i:
             self._tc_active = i
             self._sync_tonal_ui()
@@ -3470,6 +4386,7 @@ class ColourGradingDialog(Gtk.Dialog):
         self._sync_hue_ui()
 
     def _select_hue_sample(self, i):
+        self._pause_preview_for_input()
         self._hue_sel = i
         self._sync_hue_ui()
 
@@ -3655,6 +4572,7 @@ class ColourGradingDialog(Gtk.Dialog):
         self._scope_display.queue_draw()
 
     def _on_notebook_switch_page(self, notebook, page, page_num):
+        self._pause_preview_for_input()
         if page_num == 5:
             GLib.idle_add(self._initial_scope_refresh)
 
@@ -3663,11 +4581,30 @@ class ColourGradingDialog(Gtk.Dialog):
         return False
 
     def _refresh_scope(self, *_):
+        if time.monotonic() - self._last_ui_edit < 0.85:
+            self._scope_waiting = True
+            self._scope_status.set_text('Waiting for editing to pause…')
+            GLib.timeout_add(900, self._initial_scope_refresh,
+                             priority=GLib.PRIORITY_LOW)
+            return False
         try:
-            self._flush_managed_preview_now()
-            Gimp.displays_flush()
-            label = self._scope_display.refresh(self._image, getattr(self._preview, '_preview_layer', None))
+            if self._independent_worker is not None:
+                with self._independent_worker._condition:
+                    busy = self._independent_worker._job is not None or self._independent_worker._running
+                if busy:
+                    self._scope_waiting = True
+                    self._scope_status.set_text('Waiting for the independent preview…')
+                    return False
+            pb = self._preview_canvas.after_pixbuf
+            if pb is None:
+                self._scope_status.set_text('Waiting for the first preview…')
+                return False
+            k = min(320. / pb.get_width(), 240. / pb.get_height(), 1.)
+            tw = max(1, int(pb.get_width()*k)); th = max(1, int(pb.get_height()*k))
+            sample = pb.scale_simple(tw, th, GdkPixbuf.InterpType.BILINEAR) if k < 1. else pb
+            label = self._scope_display.refresh_pixbuf(sample)
             self._scopes_dirty = False
+            self._scope_waiting = False
             h = self._scope_display._hist
             total = float(sum(h[0]) or 1)
             black = max(c[0] for c in h) / total * 100.0
@@ -3788,6 +4725,7 @@ class ColourGradingDialog(Gtk.Dialog):
         root.pack_start(self._lut_combo, False, False, 0)
         self._s_lutk = GradSlider('LUT strength', 0, 100, 100, '{:.0f}%', [(0.3, 0.3, 0.3), (0.29, 0.64, 1.0)],
                                   'LUT strength: blend between your original colours (left) and the full LUT (right).')
+        self._s_lutk.connect('value-changed', lambda *_: self._lut_strength_released())
         self._s_lutk.connect('released', lambda *_: self._lut_strength_released())
         root.pack_start(self._s_lutk, False, False, 0)
         self._lut_status = _hint('No LUT loaded.')
@@ -3914,14 +4852,13 @@ class ColourGradingDialog(Gtk.Dialog):
                 self._canonical_rgb[band] = rgb
                 self._wheel_values[band] = (0, 0, *rgb)
                 self._set_hs_from_rgb(band, rgb)
-            pv._band_wheel = dict(self._canonical_rgb)
-            pv.update_wheels(self._wheel_values)
+            self._native_wheel_dirty.update(BANDS)
 
         def master():
             m = f3(st.get('master', [0, 0, 0]))
             self._master_canonical_rgb = m
             self._set_hs_from_rgb(MASTER, m)
-            pv.update_master_rgb(*m)
+            self._native_master_dirty = True
 
         def satur():
             try: gk = float(gcs.get('saturation', 100.0)) / 100.0
@@ -3930,7 +4867,7 @@ class ColourGradingDialog(Gtk.Dialog):
             self._sat_value = sat
             self._s_sat.set_value_quiet(sat * 100.0)
             self._s_sat2.set_value_quiet(sat * 100.0)
-            pv.update_saturation(sat)
+            self._native_sat_dirty = True
 
         def contrast():
             con = max(-1.0, min(1.0, float(st.get('contrast', 0))))
@@ -3938,7 +4875,7 @@ class ColourGradingDialog(Gtk.Dialog):
             self._contrast, self._pivot = con, piv
             self._s_con.set_value_quiet(con * 100.0)
             self._s_piv.set_value_quiet(piv * 100.0)
-            pv.set_contrast(con, piv)
+            self._native_contrast_dirty = True
 
         def ranges():
             r = st.get('ranges', {}) if isinstance(st.get('ranges'), dict) else {}
@@ -3948,12 +4885,16 @@ class ColourGradingDialog(Gtk.Dialog):
                 except Exception: pass
             self._ranges = merged
             for band in BANDS: self._reach[band] = _ranges_to_reach(band, merged)
-            pv.update_ranges(dict(merged))
+            self._native_ranges_dirty.update(BANDS)
 
         def targeted():
             self._load_targeted_state(st)
             pv._last_target_sig = None; pv._target_error_shown = False; pv._last_target_error = None
-            pv.update_targeted(self._tone_state, self._tonal_colour_state, self._hue_adjust_state, global_hue=self._global_hue)
+            pv._tone_state = [dict(x) for x in self._tone_state]
+            pv._tonal_colour_state = [dict(x) for x in self._tonal_colour_state]
+            pv._hue_adjust_state = [dict(x) for x in self._hue_adjust_state]
+            pv._global_hue = float(self._global_hue)
+            pv._target_dirty = True
 
         def primaries():
             prim = st.get('primaries', {}) if isinstance(st.get('primaries'), dict) else {}
@@ -3963,7 +4904,7 @@ class ColourGradingDialog(Gtk.Dialog):
             self._primaries_state = {k: {'hue': max(-180.0, min(180.0, g(k, 'hue'))),
                                          'purity': max(0.0, min(100.0, g(k, 'purity')))} for k in ('red', 'green', 'blue')}
             for k in self._primaries_state: self._sync_primary_readout(k)
-            pv.update_primaries(self._primaries_state)
+            self._pending_primaries = True
 
         def global_colour():
             def g(k, d):
@@ -3973,22 +4914,15 @@ class ColourGradingDialog(Gtk.Dialog):
                                          'tint': max(-100.0, min(100.0, g('tint', 0))),
                                          'chroma': max(-100.0, min(100.0, g('chroma', 0))), 'saturation': 100.0}
             for k, s in self._gc_sl.items(): s.set_value_quiet(self._global_colour_state[k])
-            pv.update_global_colour(self._global_colour_state)
+            self._pending_global = True
 
-        pv.begin_batch()
-        try:
-            for name, fn in (('wheels', bands), ('master', master), ('saturation', satur), ('contrast', contrast),
-                             ('ranges', ranges), ('tone / tonal colour / hue', targeted),
-                             ('primaries', primaries), ('global colour', global_colour)):
-                sect(name, fn)
-        finally:
-            try: pv.end_batch()
-            except Exception as exc: errs.append('refresh: %s' % exc); self._preview._batch_depth = 0
-        self._pending_targeted = False
-        self._pending_primaries = False
-        self._pending_global = False
+        for name, fn in (('wheels', bands), ('master', master), ('saturation', satur), ('contrast', contrast),
+                         ('ranges', ranges), ('tone / tonal colour / hue', targeted),
+                         ('primaries', primaries), ('global colour', global_colour)):
+            sect(name, fn)
         self._scopes_dirty = True
         self._sync_balance_panel()
+        self._schedule_targeted()
         return errs
 
     def _sync_all_targeted_ui(self):
@@ -4034,25 +4968,53 @@ class ColourGradingDialog(Gtk.Dialog):
             self._lut_apply(None)
 
     def _flush_pending_preview_state(self):
+        self._clamp_targeted_state()
         self._cancel_pending_preview_timers()
+        self._stop_async_target()
+        self._close_independent_viewport()
         pv = self._preview
+        if pv._target_base_buffer is None:
+            pv._force_target_init = True
+            try: pv._init_targeted_filters()
+            finally: pv._force_target_init = False
+        if pv._target_base_buffer is None:
+            raise RuntimeError('Could not prepare full-resolution GIMP output.')
+        current_lut = getattr(self, '_lut_current', None)
+        if current_lut is not None:
+            pv.set_lut(current_lut, self._s_lutk.value/100., self._lut_progress)
         pv.begin_batch()
         try:
             pv.update_wheels(self._wheel_values)
             pv.update_master_rgb(*self._master_canonical_rgb)
             pv.update_ranges(dict(self._ranges))
             pv.update_saturation(self._sat_value)
+            pv.update_primaries(self._primaries_state)
+            pv.update_global_colour(self._global_colour_state)
             pv.set_contrast(self._contrast, self._pivot)
-            self._pending_targeted = True
-            self._flush_managed_preview_now()
+            # Force exact full-resolution pixels before baking the layer.
+            # This never depends on an in-flight interactive draft.
+            pv.update_targeted(self._tone_state, self._tonal_colour_state,
+                               self._hue_adjust_state, False, self._global_hue)
         finally:
             pv.end_batch()
 
     def _on_preview_toggled(self, button):
-        self._preview.set_preview_enabled(button.get_active())
+        self._preview_canvas.hold_before(not button.get_active())
+        if button.get_active(): self._schedule_independent_viewport()
+        else:
+            if self._independent_worker is not None: self._independent_worker.invalidate()
+            self._set_preview_activity(False)
+
+    def _on_dialog_destroy(self, *_):
+        self._preview_closed = True
+        self._cancel_pending_preview_timers()
+        self._stop_async_target()
+        self._close_independent_viewport()
 
     def _on_cancel(self, _btn):
         self._cancel_pending_preview_timers()
+        self._stop_async_target()
+        self._close_independent_viewport()
         self._preview.discard()
         self.destroy()
 
@@ -4061,17 +5023,25 @@ class ColourGradingDialog(Gtk.Dialog):
         self._closing_from_window = True
         try:
             self._cancel_pending_preview_timers()
+            self._stop_async_target()
+            self._close_independent_viewport()
             self._preview.discard()
         finally:
             self.destroy()
         return True
 
     def _on_ok(self, _btn):
-        self._flush_pending_preview_state()
+        try:
+            self._flush_pending_preview_state()
+        except Exception as exc:
+            Gimp.message('Full-resolution Colour Grading could not complete: ' + str(exc))
+            return
         self._preview.set_preview_enabled(True)
         if hasattr(self._preview, 'has_active_grade') and not self._preview.has_active_grade():
             self._preview.discard(); self.destroy(); return
         if self._commit_current_fx() is None:
+            # A failed Apply leaves the dialog open. Restart lazily on the
+            # next adjustment instead of loading more buffers in this callback.
             return
         self._applied = True
         self.destroy()
@@ -4141,34 +5111,15 @@ class ColourGradingDialog(Gtk.Dialog):
         finally: self._lut_busy = False
 
     def _lut_apply(self, lut):
-        k = self._s_lutk.value / 100.0
-        self.set_sensitive(False)
-        try:
-            if lut is not None:
-                Gimp.progress_init('Applying LUT…')
-                if _np is None:
-                    self._lut_status.set_text('Applying the LUT. This can take a while on large pictures without numpy installed…')
-            self._preview.set_lut(lut, k, self._lut_progress)
-            self._lut_current = lut
-            self._scopes_dirty = True
-            if lut is None: self._lut_status.set_text('No LUT applied.')
-            else: self._lut_status.set_text('Applied “%s” (%d-point LUT).' % (lut['name'], lut['size']))
-        except Exception as exc:
-            self._lut_current = None
-            self._lut_status.set_text('Could not apply the LUT: ' + str(exc))
-            self._lut_reset_combo()
-        finally:
-            try: Gimp.progress_end()
-            except Exception: pass
-            self.set_sensitive(True)
+        self._lut_current = lut
+        self._scopes_dirty = True
+        if lut is None: self._lut_status.set_text('No LUT applied.')
+        else: self._lut_status.set_text('Selected “%s” (%d-point LUT).' % (lut['name'], lut['size']))
+        self._schedule_managed_preview()
 
     def _lut_strength_released(self):
-        if self._lut_current is None: return
-        try:
-            self._preview.set_lut(self._lut_current, self._s_lutk.value / 100.0)
-            self._scopes_dirty = True
-        except Exception as exc:
-            self._lut_status.set_text('Could not change the LUT strength: ' + str(exc))
+        if self._lut_current is not None:
+            self._schedule_managed_preview()
 
     def _show_lut_links(self, *_):
         d = Gtk.Dialog(title='Get free LUTs', transient_for=self, modal=True)
@@ -4270,22 +5221,231 @@ class ColourGradingDialog(Gtk.Dialog):
     def _hue_defaults():
         return {'hue':0.0,'saturation':0.0,'luminance':0.0,'range':20.0,'spread':.5}
 
-    def _schedule_targeted(self):
-        self._pending_targeted=True; self._scopes_dirty=True; self._schedule_managed_preview()
+    def _before_key_press(self, _widget, event):
+        if event.keyval in (Gdk.KEY_b, Gdk.KEY_B) and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK)):
+            # Do not steal typed B from file chooser/text entry controls.
+            focus = self.get_focus()
+            if not isinstance(focus, (Gtk.Entry, Gtk.TextView)):
+                self._preview_canvas.hold_before(True)
+                return True
+        return False
 
-    def _flush_targeted_release(self,*_):
-        sid=getattr(self,'_managed_preview_timer',None)
+    def _before_key_release(self, _widget, event):
+        if event.keyval in (Gdk.KEY_b, Gdk.KEY_B):
+            self._preview_canvas.hold_before(not self._global_preview.get_active())
+            return True
+        return False
+
+    def _schedule_independent_viewport(self):
+        if self._preview_closed or self._preview_canvas is None: return
+        if hasattr(self, '_zoom_display'):
+            z = self._preview_canvas.zoom
+            self._zoom_display.set_text('%.0f%%' % (100.*z))
+        # Leading-edge coalescing: continuous drags still get update attempts.
+        # There is never a queue of per-movement renders.
+        if self._independent_timer is None:
+            delay = 65 if self._preview_pixels <= 2000000 else 115
+            self._independent_timer = GLib.timeout_add(
+                delay, self._dispatch_independent_preview, priority=GLib.PRIORITY_LOW)
+
+    def _dispatch_independent_preview(self):
+        self._independent_timer = None
+        worker = self._independent_worker
+        if worker is None or self._preview_closed: return False
+        canvas = self._preview_canvas
+        if not self._global_preview.get_active():
+            canvas.hold_before(True)
+            self._set_preview_activity(False)
+            return False
+        roi, dimensions = canvas.render_plan()
+        self._clamp_targeted_state()
+        job = {'roi':roi, 'size':dimensions, 'grade':self._grade_state(),
+               'lut':getattr(self, '_lut_current', None),
+               'lut_strength':getattr(self, '_s_lutk', None).value/100. if hasattr(self, '_s_lutk') else 1.}
+        # Picking another tone or tab must not launch an identical render.
+        signature = json.dumps((roi, dimensions, job['grade'], id(job['lut']), job['lut_strength']),
+                               sort_keys=True, separators=(',', ':'))
+        if signature == self._independent_signature:
+            return False
+        self._independent_signature = signature
+        worker.submit(job)
+        self._set_preview_activity(True, 'Updating preview…')
+        return False
+
+    def _independent_preview_result(self, data, error):
+        if error:
+            self._independent_signature = None
+            self._set_preview_activity(True, 'Preview error — see terminal')
+            _dbg('Viewport: ' + error)
+            return
+        if data is not None:
+            roi, size, before, after = data
+            try:
+                self._preview_canvas.set_pixels(roi, size, before, after)
+                self._set_preview_activity(False)
+                if self._scope_waiting and self._nb.get_current_page() == 5:
+                    GLib.idle_add(self._refresh_scope, priority=GLib.PRIORITY_LOW)
+            except Exception as exc:
+                self._set_preview_activity(True, 'Preview display error')
+                _dbg('Viewport display: %r' % exc)
+
+    def _close_independent_viewport(self):
+        if self._independent_timer is not None:
+            try: GLib.source_remove(self._independent_timer)
+            except Exception: pass
+            self._independent_timer = None
+        if self._independent_worker is not None:
+            self._independent_worker.close()
+            self._independent_worker = None
+
+    def _get_async_target(self):
+        if self._async_preview is not None:
+            return self._async_preview
+        if self._async_unavailable or not self._preview._initialised:
+            return None
+        try:
+            self._async_preview = _AsyncTargetPreview(self)
+            return self._async_preview
+        except Exception as exc:
+            self._async_unavailable = True
+            _dbg('background preview unavailable; standard preview retained: %r' % (exc,))
+            # Do not abort or prevent the plug-in from functioning; fall back
+            # to its existing native GEGL preview path.
+            return None
+
+    def _set_preview_activity(self, active, text='Updating preview…'):
+        if not hasattr(self, '_preview_state_label'):
+            return
+        self._preview_state_label.set_text(text if active else '')
+        if active:
+            self._preview_spinner.start()
+        else:
+            self._preview_spinner.stop()
+
+    def _abort_async_copy(self):
+        self._async_ready = None
+        sid = self._async_copy_sid
+        self._async_copy_sid = None
         if sid is not None:
             try: GLib.source_remove(sid)
             except Exception: pass
-            self._managed_preview_timer=None
-        sid=getattr(self,'_final_timer',None)
-        if sid is not None:
-            try: GLib.source_remove(sid)
+        state = self._async_copy
+        self._async_copy = None
+        if state is not None and state.get('frozen'):
+            try: state['target'].thaw_changed()
             except Exception: pass
-            self._final_timer=None
-        self._pending_targeted=True; self._scopes_dirty=True
-        self._flush_managed_preview_now(); return False
+
+    def _invalidate_async_target(self):
+        if self._async_preview is not None:
+            self._async_preview.invalidate()
+        # A buffer already being transferred is allowed to complete before
+        # publishing any newer result; aborting a frozen partial buffer would
+        # expose an incomplete image to GIMP on thaw_changed().
+
+    def _stop_async_target(self):
+        if self._async_preview is not None:
+            self._async_preview.close()
+            self._async_preview = None
+        self._abort_async_copy()
+        self._set_preview_activity(False)
+
+    def _pause_preview_for_input(self):
+        # Merely selecting a different tab/zone does not alter the grade.
+        # In particular it must not postpone an otherwise ready preview.
+        pass
+
+    def _schedule_targeted(self):
+        self._pending_targeted = True
+        self._scopes_dirty = True
+        self._schedule_managed_preview()
+
+    def _flush_targeted_release(self, *_):
+        # Releasing a control is just another snapshot; no main-thread render.
+        self._schedule_independent_viewport()
+        return False
+
+    def _receive_async_target(self, generation, result, draft, duration, error):
+        if self._async_preview is None or not self._async_preview.is_current(generation):
+            return
+        if error:
+            self._preview._stage_warning('Background preview — ' + error)
+            _dbg('async preview fallback: ' + error)
+            self._stop_async_target()
+            self._async_unavailable = True
+            self._set_preview_activity(False)
+            return
+        if result is None:
+            return
+        if self._async_copy is not None:
+            # Keep just the latest completed result, never abort a partially
+            # copied buffer and expose an unfinished frame.
+            self._async_ready = (generation, result, draft, duration, error)
+            return
+        try:
+            target = self._preview._preview_layer.get_buffer()
+            ext = target.get_extent()
+            target.freeze_changed()
+            self._async_copy = {'generation': generation, 'source': result,
+                                'target': target, 'extent': ext,
+                                'row': 0, 'draft': draft, 'frozen': True}
+            self._last_render_ms = duration
+            self._async_copy_sid = GLib.timeout_add(
+                _AsyncTargetPreview.COPY_SLICE_MS,
+                self._copy_async_slice, priority=GLib.PRIORITY_DEFAULT_IDLE)
+        except Exception as exc:
+            self._abort_async_copy()
+            _dbg('preview transfer failed: %r' % (exc,))
+            self._set_preview_activity(False, 'Preview error')
+
+    def _copy_async_slice(self):
+        self._async_copy_sid = None
+        state = self._async_copy
+        if state is None:
+            return False
+        # The caller's pointer events always run before idle-priority slices.
+        # Do not add a 750 ms dead period after the worker has finished.
+        # Once a transfer starts, finish it before showing the newer result.
+        try:
+            extent = state['extent']
+            row = state['row']
+            rows = max(8, min(256, _AsyncTargetPreview.COPY_PIXELS // max(1, extent.width)))
+            count = min(rows, extent.height - row)
+            rect = Gegl.Rectangle.new(extent.x, extent.y + row, extent.width, count)
+            state['source'].copy(rect, Gegl.AbyssPolicy.NONE, state['target'], rect)
+            state['row'] += count
+            if state['row'] < extent.height:
+                self._async_copy_sid = GLib.timeout_add(
+                    _AsyncTargetPreview.COPY_SLICE_MS, self._copy_async_slice,
+                    priority=GLib.PRIORITY_DEFAULT_IDLE)
+                return False
+            state['target'].thaw_changed()
+            state['frozen'] = False
+            state['target'].flush()
+            self._preview._preview_layer.update(0, 0, extent.width, extent.height)
+            # Only the finished preview triggers a display update.
+            self._preview._display_flush()
+            self._preview._last_target_sig = None
+            self._preview._last_draft_sig = None
+            self._preview._target_dirty = True
+            self._async_copy = None
+            self._async_copy_sid = None
+            ready = self._async_ready
+            self._async_ready = None
+            if ready is not None and self._async_preview is not None and self._async_preview.is_current(ready[0]):
+                GLib.idle_add(self._receive_async_target, *ready, priority=GLib.PRIORITY_DEFAULT_IDLE)
+            if (not state['draft'] and self._scope_waiting
+                    and self._nb.get_current_page() == 5):
+                GLib.idle_add(self._refresh_scope, priority=GLib.PRIORITY_LOW)
+            if state['draft'] and self._final_timer is not None:
+                self._set_preview_activity(True, 'Refining preview…')
+            else:
+                self._set_preview_activity(False)
+            return False
+        except Exception as exc:
+            _dbg('preview transfer failed: %r' % (exc,))
+            self._abort_async_copy()
+            self._set_preview_activity(False, 'Preview error')
+            return False
 
     def _make_pick_button(self,tip,callback,text):
         pick=GimpUi.PickButton.new(); pick.set_tooltip_text(tip); pick.connect('color-picked',callback)
@@ -4637,114 +5797,87 @@ class ColourGradingDialog(Gtk.Dialog):
             except Exception as exc: Gimp.message('Preset import failed: '+str(exc))
         d.destroy()
 
+    # Fast images must not inherit multi-second large-image preview delays.
+    # Throttle is leading-edge: continuous pointer motion does not repeatedly
+    # reset the timer, and intermediate states are coalesced into the latest.
+    FULL_QUIET_MS = 850
+
+    def _preview_delay_ms(self):
+        px = self._preview_pixels
+        return 45 if px <= 2000000 else (95 if px <= 8000000 else 135)
+
     def _schedule_managed_preview(self):
-        if self._managed_preview_timer is not None: return
-        last=float(getattr(self,'_last_render_ms',0.0))
-        delay=int(max(40.0,min(300.0,last*0.8+20.0)))
-        self._managed_preview_timer=GLib.timeout_add(delay,self._flush_managed_preview)
+        if self._preview_closed: return
+        self._last_ui_edit = time.monotonic()
+        self._scopes_dirty = True
+        self._schedule_independent_viewport()
 
     def _final_full_render(self):
-        self._final_timer=None
-        self._pending_targeted=True
-        self._flush_managed_preview_now()
+        # Full-quality GIMP rendering occurs ONLY on Apply.
+        self._final_timer = None
         return False
 
     def _clamp_targeted_state(self):
         def cl(d,k,lo,hi,default):
             try: v=float(d.get(k,default))
             except Exception: v=default
-            if v!=v: v=default
+            if not math.isfinite(v): v=default
             d[k]=max(lo,min(hi,v))
         for p in self._tone_state:
             cl(p,'pos',.02,.98,.5); cl(p,'brightness',-100,100,0); cl(p,'range',.02,.5,.18); cl(p,'spread',0,1,.5)
         for p in self._tonal_colour_state:
-            p['hue']=float(p.get('hue',0) or 0)%360.0
+            p['hue']=float(p.get('hue',0) or 0)%360.
             cl(p,'strength',0,100,0); cl(p,'luminance',-100,100,0); cl(p,'range',.02,.5,.2); cl(p,'spread',0,1,.55)
-        self._global_hue=max(-180.0,min(180.0,float(self._global_hue)))
+        self._global_hue=max(-180.,min(180.,float(self._global_hue)))
         for p in self._hue_adjust_state:
-            p['source_hue']=float(p.get('source_hue',0) or 0)%360.0; cl(p,'hue',-180,180,0); cl(p,'saturation',-100,100,0)
+            p['source_hue']=float(p.get('source_hue',0) or 0)%360.
+            cl(p,'hue',-180,180,0); cl(p,'saturation',-100,100,0)
             cl(p,'luminance',-100,100,0); cl(p,'range',2,90,20); cl(p,'spread',0,1,.5)
 
     def _flush_managed_preview(self):
-        self._managed_preview_timer=None
-        self._flush_managed_preview_now(True)
-        if getattr(self,'_draft_used',False):
-            self._draft_used=False
-            sid=getattr(self,'_final_timer',None)
-            if sid is not None:
-                try: GLib.source_remove(sid)
-                except Exception: pass
-            self._final_timer=GLib.timeout_add(450,self._final_full_render)
+        self._managed_preview_timer = None
         return False
 
     def _flush_managed_preview_now(self,draft=False):
-        if not any((self._pending_targeted,self._pending_primaries,self._pending_global)):
-            return
-        self._last_flush_t=time.monotonic()
-        try: self._clamp_targeted_state()
-        except Exception as exc: _dbg('clamp failed: %r'%(exc,))
-        self._preview.begin_batch()
-        try:
-            targ=self._pending_targeted; self._pending_targeted=False
-            prim=self._pending_primaries; self._pending_primaries=False
-            glob=self._pending_global; self._pending_global=False
-            if targ:
-                t0=time.monotonic()
-                self._preview.update_targeted(self._tone_state,self._tonal_colour_state,self._hue_adjust_state,draft,self._global_hue)
-                self._last_render_ms=(time.monotonic()-t0)*1000.0
-                if draft and getattr(self._preview,'_draft_ctx',None) is not None: self._draft_used=True
-            if prim: self._preview.update_primaries(self._primaries_state)
-            if glob: self._preview.update_global_colour(self._global_colour_state)
-        finally:
-            self._preview.end_batch()
-        if hasattr(self,'_colour_diag_button'): self._refresh_colour_diagnostics()
+        # Never invoke Gimp.DrawableFilter.update(), Gimp.displays_flush(),
+        # or a full-resolution GEGL transfer from an editing callback.
+        self._schedule_independent_viewport()
 
     def _primary_changed(self,key,prop,value):
         if not hasattr(self,'_primaries_state'):
             self._primaries_state={k:{'hue':0.0,'purity':0.0} for k in ('red','green','blue')}
         self._primaries_state[key][prop]=float(value)
         self._scopes_dirty=True; self._pending_primaries=True; self._schedule_managed_preview()
-        if hasattr(self,'_colour_diag_button'): self._refresh_colour_diagnostics()
 
     def _global_colour_changed(self,key,value):
         if not hasattr(self,'_global_colour_state'):
             self._global_colour_state={'temperature':0.0,'tint':0.0,'chroma':0.0,'saturation':100.0}
         self._global_colour_state[key]=float(value)
         self._scopes_dirty=True; self._pending_global=True; self._schedule_managed_preview()
-        if hasattr(self,'_colour_diag_button'): self._refresh_colour_diagnostics()
 
     def _ask(self,title,text,ok):
         d=Gtk.MessageDialog(transient_for=self,modal=True,message_type=Gtk.MessageType.WARNING,buttons=Gtk.ButtonsType.NONE,text=title); d.format_secondary_text(text); d.add_button('Cancel',Gtk.ResponseType.CANCEL); d.add_button(ok,Gtk.ResponseType.OK); r=d.run(); d.destroy(); return r==Gtk.ResponseType.OK
 
     def _push_band_colour(self, band, r, g, b):
         self._canonical_rgb[band] = (float(r), float(g), float(b))
-        self._preview._band_wheel[band] = self._canonical_rgb[band]
         self._wheel_values[band] = (0.0, 0.0, r, g, b)
-
-        if self._wheel_timer[band] is None:
-            self._wheel_timer[band] = GLib.timeout_add(PREVIEW_FAST_MS, self._flush_colour, band)
+        self._native_wheel_dirty.add(band)
+        self._schedule_managed_preview()
 
     def _flush_colour(self, band):
         self._wheel_timer[band] = None
-        if not self._preview._initialised:
-            return False
-
-        try:
-            _, _, r, g, b = self._wheel_values[band]
-            self._preview._band_wheel[band] = (r, g, b)
-            self._preview._apply_band(band)
-            self._preview._display_flush()
-        except Exception as exc:
-            self._preview._error_dialog(exc, 'Failed to update colour control')
+        self._native_wheel_dirty.add(band)
+        self._schedule_managed_preview()
         return False
 
     def _flush_master_rgb(self):
         self._master_timer = None
-        r, g, b = self._master_canonical_rgb
-        self._preview.update_master_rgb(r, g, b)
+        self._native_master_dirty = True
+        self._schedule_managed_preview()
         return False
 
     def _cancel_pending_preview_timers(self):
+        self._invalidate_async_target()
         for band in BANDS:
             sid = self._wheel_timer.get(band)
             if sid is not None:
@@ -4790,7 +5923,18 @@ def _run(procedure, run_mode, image, drawables, config, data):
         sel = image.get_selected_layers()
         if sel: layer = sel[0]
     except Exception: pass
-    dialog = ColourGradingDialog(image, layer)
+    try:
+        dialog = ColourGradingDialog(image, layer)
+    except Exception as exc:
+        # Make a GTK startup error visible instead of failing without a window.
+        import traceback
+        details = traceback.format_exc()
+        print('[Colour Grading startup] ' + details, file=sys.stderr, flush=True)
+        try:
+            Gimp.message('Colour Grading could not open: ' + str(exc) + '\n\n' + details[-1600:])
+        except Exception:
+            pass
+        return procedure.new_return_values(Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error())
     if dialog._ready:
         dialog.connect('destroy', lambda *_: Gtk.main_quit())
         dialog.show_all()
